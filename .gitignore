@@ -29,6 +29,8 @@ audit.checkpoint
 vault/
 storage/
 backups/
+!src-tauri/src/storage/
+!src-tauri/src/storage/**
 
 # Local test and temporary data
 test/
