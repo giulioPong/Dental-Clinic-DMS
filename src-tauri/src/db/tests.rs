@@ -152,7 +152,7 @@ fn migrazioni_idempotenti() {
 
 #[test]
 fn migration_v1_congelata() {
-    let h = hex(&Sha256::digest(MIGRATION_V1.as_bytes()));
+    let h = hex(&Sha256::digest(MIGRATION_V1.replace("\r\n", "\n").as_bytes()));
     match FROZEN_V1_SHA256 {
         Some(f) => assert_eq!(h, f, "MIGRATION_V1 è congelata: crea una nuova migrazione"),
         None => eprintln!("MIGRATION_V1 sha256 = {h}"),
@@ -467,11 +467,17 @@ fn purge_elimina_solo_il_cestino_scaduto_ed_e_ripetibile() {
 
     let mut removed: Vec<String> = Vec::new();
     let blocked = format!("{p4_doc}.enc");
-    let r = d.purge_expired(30, |name| {
-        if name == blocked { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "occupato")); }
-        removed.push(name.to_string());
-        Ok(())
-    }).unwrap();
+    let r = d.purge_expired(
+        30,
+        |name| {
+            if name == blocked { return Err(io::Error::new(io::ErrorKind::PermissionDenied, "occupato")); }
+            Ok(true)
+        },
+        |name, staged, committed| {
+            assert!(staged && committed);
+            removed.push(name.to_string());
+        },
+    ).unwrap();
     assert_eq!(r, PurgeReport { documents: 2, patients: 1, failed_files: 1 });
     removed.sort();
     let mut expected = vec![format!("{p1_old}.enc"), format!("{p2_doc}.enc")];
@@ -484,7 +490,7 @@ fn purge_elimina_solo_il_cestino_scaduto_ed_e_ripetibile() {
     let _ = p1_live;
 
     // seconda esecuzione: ora il file di p4 è rimovibile ("non trovato" conta come ok)
-    let r2 = d.purge_expired(30, |_| Err(io::Error::new(io::ErrorKind::NotFound, "già assente"))).unwrap();
+    let r2 = d.purge_expired(30, |_| Ok(false), |_, staged, _| assert!(!staged)).unwrap();
     assert_eq!(r2, PurgeReport { documents: 1, patients: 1, failed_files: 0 });
     assert_eq!(count("SELECT count(*) FROM patients"), 2);
     assert!(d.verify_audit_chain(None).is_ok()); // l'audit resta integro e non viene toccato
@@ -498,7 +504,7 @@ fn db_with_audit() -> Db {
     let d = db();
     let p = patient(&d, "Mario", "Rossi", "1980-05-12");
     d.log_audit("VIEW_PATIENT", Some(&p), None).unwrap();
-    d.log_audit("OPEN_FILE", Some("x"), Some("viewer")).unwrap();
+    d.log_audit("OPEN_FILE", Some(&new_uuid()), Some("documents=1")).unwrap();
     d.log_audit("EXPORT_ZIP", Some(&p), None).unwrap();
     d
 }
@@ -524,20 +530,20 @@ fn audit_catena_valida_e_trigger_append_only() {
 fn audit_rileva_modifica_cancellazione_e_buchi() {
     let d = db_with_audit();
     tamper(&d, "UPDATE audit_log SET details='falso' WHERE id=2");
-    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered(_))));
+    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered { .. })));
 
     let d = db_with_audit();
     tamper(&d, "DELETE FROM audit_log WHERE id=2");
-    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered(_))));
+    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered { .. })));
 
     let d = db_with_audit();
     tamper(&d, "DELETE FROM audit_log WHERE id=1"); // testa del log
-    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered(_))));
+    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered { .. })));
 
     // anche ricalcolando row_hash senza la chiave non si riesce a falsificare
     let d = db_with_audit();
     tamper(&d, &format!("UPDATE audit_log SET details='falso', row_hash='{}' WHERE id=3", "b".repeat(64)));
-    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered(_))));
+    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered { .. })));
 }
 
 #[test]
@@ -550,13 +556,13 @@ fn audit_troncamento_in_coda_visibile_solo_con_checkpoint_o_alla_scrittura_succe
 
     tamper(&d, "DELETE FROM audit_log WHERE id=4");
     assert_eq!(d.verify_audit_chain(None).unwrap(), 3); // da solo il log sembra valido...
-    assert!(matches!(d.verify_audit_chain(Some(&cp)), Err(DbError::AuditTampered(_)))); // ...col checkpoint no
+    assert!(matches!(d.verify_audit_chain(Some(&cp)), Err(DbError::AuditTampered { .. }))); // ...col checkpoint no
 
     // alla scrittura successiva il contatore AUTOINCREMENT crea un buco
     d.conn.execute_batch(
         "CREATE TRIGGER audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT,'x'); END;").unwrap();
     d.log_audit("VIEW_PATIENT", None, None).unwrap();
-    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered(_))));
+    assert!(matches!(d.verify_audit_chain(None), Err(DbError::AuditTampered { .. })));
 }
 
 #[test]
@@ -564,7 +570,7 @@ fn audit_checkpoint_e_chiave_errata_non_validano() {
     let d = db_with_audit();
     let mut cp = d.audit_checkpoint().unwrap();
     cp.mac = "0".repeat(64);
-    assert!(matches!(d.verify_audit_chain(Some(&cp)), Err(DbError::AuditTampered(_))));
+    assert!(matches!(d.verify_audit_chain(Some(&cp)), Err(DbError::AuditTampered { .. })));
     assert!(verify_chain(&d.conn, &[9u8; 32], None).is_err()); // chiave audit diversa
     assert!(AuditCheckpoint::from_line("non un checkpoint").is_none());
 }
@@ -580,4 +586,127 @@ fn audit_su_log_vuoto_e_actor_personalizzato() {
     d.log_audit("VIEW_PATIENT", None, None).unwrap();
     let actor: String = d.conn.query_row("SELECT actor FROM audit_log", [], |r| r.get(0)).unwrap();
     assert_eq!(actor, "segreteria");
+}
+
+#[test]
+fn audit_rifiuta_dati_personali_in_details_e_target() {
+    let d = db();
+    let id = new_uuid();
+    for bad in ["Mario Rossi", "cf=RSSMRA80E12A944X", "file=C:\\pazienti\\rx.jpg", "nome=mario", "documents=", "=3", "a=1;;b=2"] {
+        assert!(matches!(d.log_audit("VIEW_PATIENT", Some(&id), Some(bad)), Err(DbError::InvalidInput(_))), "{bad}");
+    }
+    for bad in ["Mario Rossi", "RSSMRA80E12A944X", ""] {
+        assert!(matches!(d.log_audit("VIEW_PATIENT", Some(bad), None), Err(DbError::InvalidInput(_))), "{bad}");
+    }
+    d.log_audit("REASSIGN_DOCUMENT", Some(&id), Some(&format!("from={};to={}", new_uuid(), new_uuid()))).unwrap();
+    d.log_audit("EXPORT_AUDIT", None, Some("rows=12;from=2026-01-01;to=2026-12-31")).unwrap();
+    d.log_audit("CHANGE_PASSWORD", None, None).unwrap();
+    assert_eq!(d.verify_audit_chain(None).unwrap(), 3);
+}
+
+#[test]
+fn audit_tampered_indica_la_riga() {
+    let row = |r: Result<u64>| match r {
+        Err(DbError::AuditTampered { row_id, .. }) => row_id,
+        other => panic!("atteso AuditTampered, ottenuto {other:?}"),
+    };
+    let d = db_with_audit();
+    tamper(&d, "UPDATE audit_log SET details='falso' WHERE id=2");
+    assert_eq!(row(d.verify_audit_chain(None)), Some(2));
+
+    let d = db_with_audit();
+    tamper(&d, "DELETE FROM audit_log WHERE id=2");
+    assert_eq!(row(d.verify_audit_chain(None)), Some(3)); // il buco si vede sulla riga successiva
+
+    let d = db_with_audit();
+    let cp = d.audit_checkpoint().unwrap();
+    tamper(&d, "DELETE FROM audit_log WHERE id=4");
+    assert_eq!(row(d.verify_audit_chain(Some(&cp))), Some(4));
+
+    let d = db_with_audit();
+    let mut cp = d.audit_checkpoint().unwrap();
+    cp.mac = "0".repeat(64);
+    assert_eq!(row(d.verify_audit_chain(Some(&cp))), None);
+}
+
+#[test]
+fn audit_entries_filtra_per_data_e_actor_ha_default() {
+    let d = db_with_audit();
+    let today: String = d.conn.query_row("SELECT strftime('%Y-%m-%d','now')", [], |r| r.get(0)).unwrap();
+    assert_eq!(d.audit_entries(None, None).unwrap().len(), 4);
+    assert_eq!(d.audit_entries(Some(&today), Some(&today)).unwrap().len(), 4);
+    assert_eq!(d.audit_entries(Some("2100-01-01"), None).unwrap().len(), 0);
+    assert_eq!(d.audit_entries(None, Some("2000-01-01")).unwrap().len(), 0);
+    let e = &d.audit_entries(None, None).unwrap()[0];
+    assert_eq!((e.id, e.action.as_str(), e.prev_hash.as_str()), (1, "CREATE_PATIENT", GENESIS_HASH));
+    for bad in ["2026-02-30", "26-01-01", "oggi"] {
+        assert!(matches!(d.audit_entries(Some(bad), None), Err(DbError::InvalidInput(_))), "{bad}");
+    }
+    let dflt: Option<String> = d
+        .conn
+        .query_row("SELECT dflt_value FROM pragma_table_info('audit_log') WHERE name = 'actor'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(dflt.as_deref(), Some("'admin'"));
+}
+
+#[test]
+fn audit_entries_filtra_per_giorno_locale() {
+    let d = db();
+    let h = "0".repeat(64);
+    // istanti attorno alla mezzanotte UTC del 27 e alla fine del giorno
+    let stamps = [
+        "2026-11-26T21:30:00.000Z",
+        "2026-11-26T23:30:00.000Z",
+        "2026-11-27T00:00:00.000Z",
+        "2026-11-27T12:00:00.000Z",
+        "2026-11-27T22:30:00.000Z",
+        "2026-11-27T23:59:59.999Z",
+        "2026-11-28T00:30:00.000Z",
+    ];
+    for (i, ts) in stamps.iter().enumerate() {
+        d.conn
+            .execute(
+                "INSERT INTO audit_log (id, timestamp, action, prev_hash, row_hash) VALUES (?1, ?2, 'VIEW_PATIENT', ?3, ?3)",
+                params![i as i64 + 1, ts, h],
+            )
+            .unwrap();
+    }
+    // giorno locale di ogni riga, calcolato indipendentemente in Rust a partire dallo
+    // scarto che SQLite applica: il test vale con qualunque fuso del computer
+    let local_day = |ts: &str| -> String {
+        d.conn.query_row("SELECT date(?1, 'localtime')", params![ts], |r| r.get(0)).unwrap()
+    };
+    let expect = |from: Option<&str>, to: Option<&str>| -> Vec<i64> {
+        stamps
+            .iter()
+            .enumerate()
+            .filter(|(_, ts)| {
+                let day = local_day(ts);
+                from.is_none_or(|f| day.as_str() >= f) && to.is_none_or(|t| day.as_str() <= t)
+            })
+            .map(|(i, _)| i as i64 + 1)
+            .collect()
+    };
+    let ids = |from: Option<&str>, to: Option<&str>| -> Vec<i64> {
+        d.audit_entries(from, to).unwrap().iter().map(|e| e.id).collect()
+    };
+    for (f, t) in [
+        (Some("2026-11-27"), Some("2026-11-27")),
+        (None, Some("2026-11-27")),
+        (Some("2026-11-27"), None),
+        (Some("2026-11-26"), Some("2026-11-26")),
+        (Some("2026-11-28"), Some("2026-11-28")),
+    ] {
+        assert_eq!(ids(f, t), expect(f, t), "{f:?}..{t:?}");
+    }
+    // ogni giorno locale è coperto per intero: i tre giorni insieme danno tutte le righe
+    let total: usize = ["2026-11-26", "2026-11-27", "2026-11-28"].iter().map(|g| ids(Some(g), Some(g)).len()).sum();
+    assert_eq!(total, stamps.len());
+
+    // con un fuso noto: a Roma (UTC+1 d'inverno) le 23:30Z del 26 sono le 00:30 del 27
+    let off: String = d.conn.query_row("SELECT strftime('%H', '2026-11-27T12:00:00Z', 'localtime')", [], |r| r.get(0)).unwrap();
+    if off == "13" {
+        assert_eq!(ids(Some("2026-11-27"), Some("2026-11-27")), vec![2, 3, 4, 5]);
+        assert_eq!(d.audit_entries(None, None).unwrap()[1].timestamp_local, "2026-11-27 00:30:00");
+    }
 }

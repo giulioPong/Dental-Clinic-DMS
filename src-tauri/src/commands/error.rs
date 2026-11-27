@@ -93,7 +93,13 @@ impl From<DbError> for CommandError {
                 Self::new(ErrorCode::DuplicateFiscalCode, "Esiste già una scheda con questo codice fiscale.").with_detail(existing_id)
             }
             PatientInTrash => Self::new(ErrorCode::PatientInTrash, "Il paziente è nel cestino."),
-            AuditTampered(m) => Self::new(ErrorCode::AuditTampered, &format!("Registro degli accessi non coerente: {m}")),
+            AuditTampered { row_id, reason } => {
+                let e = Self::new(ErrorCode::AuditTampered, &format!("Registro degli accessi non coerente: {reason}"));
+                match row_id {
+                    Some(id) => e.with_detail(format!("row_id={id}")),
+                    None => e,
+                }
+            }
             Io(_) => Self::new(ErrorCode::IoError, "Errore di lettura o scrittura su disco."),
             Sqlite(_) => Self::new(ErrorCode::DbError, "Errore del database."),
             SqlcipherMissing => Self::new(ErrorCode::Internal, "Cifratura del database non disponibile in questa build."),
@@ -118,6 +124,7 @@ impl From<StorageError> for CommandError {
             IntegrityMismatch(_) => Self::new(ErrorCode::Corrupted, "Il documento non corrisponde ai dati registrati."),
             DestinationExists => Self::new(ErrorCode::AlreadyExists, "Il file di destinazione esiste già."),
             InvalidInput(m) => Self::invalid(m),
+            Cancelled => Self::locked(),
             // Qui il percorso serve: c'è un file in chiaro da cancellare a mano.
             CleanupFailed { path, .. } => Self::new(
                 ErrorCode::CleanupFailed,

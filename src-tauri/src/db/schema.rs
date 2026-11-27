@@ -4,8 +4,10 @@ use super::*;
 
 pub(super) const MIGRATIONS: &[&str] = &[MIGRATION_V1];
 
-/// Se `Some(hash)`, il test `migration_v1_congelata` fallisce quando MIGRATION_V1 cambia.
-pub(super) const FROZEN_V1_SHA256: Option<&str> = None;
+/// MIGRATION_V1 è congelata: il test `migration_v1_congelata` fallisce se cambia. Un DB già
+/// creato non la rieseguirebbe, quindi ogni modifica allo schema va in una MIGRATION_V2.
+/// L'hash è calcolato sul testo con a capo LF (Git su Windows può estrarlo in CRLF).
+pub(super) const FROZEN_V1_SHA256: Option<&str> = Some("13f66e0d9dfd17cdd236d75252341178336c947016ae110285b3fb366e96e8fb");
 
 pub const CATEGORY_TAGS: [&str; 6] = ["Panoramica", "Endorale", "Scan 3D", "Consenso", "Preventivo", "Altro"];
 
@@ -89,14 +91,16 @@ CREATE INDEX idx_documents_patient ON documents(patient_id, deleted_at, created_
 -- row_hash = HMAC-SHA256(chiave audit, id | campi con lunghezza | prev_hash).
 -- I trigger bloccano UPDATE/DELETE da codice; la catena rende visibili le
 -- modifiche fatte aggirando i trigger (vedi verify_audit_chain).
--- details: solo ID e conteggi, mai nomi o dati clinici.
+-- details: solo ID e conteggi, mai nomi o dati clinici (verificato in audit_append).
+-- Così il diritto all'oblio sull'anagrafica non tocca il log, che resta valido.
 CREATE TABLE audit_log (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     timestamp  TEXT NOT NULL,
-    actor      TEXT NOT NULL,
+    actor      TEXT NOT NULL DEFAULT 'admin',
     action     TEXT NOT NULL CHECK (action IN (
         'CREATE_PATIENT','UPDATE_PATIENT','VIEW_PATIENT','DELETE_PATIENT','RESTORE_PATIENT','PURGE_PATIENT',
-        'UPLOAD_FILE','OPEN_FILE','EXPORT_ZIP','DELETE_FILE','RESTORE_FILE','PURGE_FILE','REASSIGN_DOCUMENT')),
+        'UPLOAD_FILE','OPEN_FILE','EXPORT_ZIP','DELETE_FILE','RESTORE_FILE','PURGE_FILE','REASSIGN_DOCUMENT',
+        'CHANGE_PASSWORD','EXPORT_AUDIT')),
     target_id  TEXT,
     details    TEXT,
     prev_hash  TEXT NOT NULL CHECK (length(prev_hash) = 64 AND prev_hash NOT GLOB '*[^0-9a-f]*'),

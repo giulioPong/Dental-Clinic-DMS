@@ -17,6 +17,8 @@ pub enum StorageError {
     /// Il contenuto decifrato non coincide con dimensione o SHA-256 registrati nel DB.
     IntegrityMismatch(String),
     DestinationExists,
+    /// Operazione interrotta: l'archivio è stato bloccato mentre era in corso.
+    Cancelled,
     InvalidInput(&'static str),
     /// L'operazione è fallita E non è stato possibile rimuovere un file in chiaro: va cancellato a mano.
     CleanupFailed { path: PathBuf, cause: String, io: String },
@@ -36,6 +38,7 @@ impl std::fmt::Display for StorageError {
             Self::IntegrityMismatch(id) => write!(f, "il documento {id} non corrisponde ai dati registrati"),
             Self::DestinationExists => write!(f, "la destinazione esiste già"),
             Self::InvalidInput(m) => write!(f, "dato non valido: {m}"),
+            Self::Cancelled => write!(f, "operazione interrotta dal blocco dell'archivio"),
             Self::CleanupFailed { path, cause, io } => write!(
                 f, "{cause}; inoltre non è stato possibile rimuovere {} ({io}): cancellalo manualmente", path.display()
             ),

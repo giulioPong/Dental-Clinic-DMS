@@ -18,7 +18,9 @@ pub enum DbError {
     InvalidState(&'static str),
     DuplicateFiscalCode { existing_id: String },
     PatientInTrash,
-    AuditTampered(String),
+    /// Catena dell'audit non coerente. `row_id`: prima riga dove la verifica fallisce
+    /// (`None` se il problema è il checkpoint stesso).
+    AuditTampered { row_id: Option<i64>, reason: String },
 }
 
 impl std::fmt::Display for DbError {
@@ -37,7 +39,7 @@ impl std::fmt::Display for DbError {
                 write!(f, "esiste già una scheda con questo codice fiscale ({existing_id})")
             }
             Self::PatientInTrash => write!(f, "il paziente è nel cestino"),
-            Self::AuditTampered(m) => write!(f, "audit log manomesso: {m}"),
+            Self::AuditTampered { reason, .. } => write!(f, "audit log manomesso: {reason}"),
         }
     }
 }

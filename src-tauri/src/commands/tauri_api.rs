@@ -11,7 +11,9 @@
 //!
 //! Eventi verso il frontend: `vault-locked` (mostra subito la Lock Screen),
 //! `upload-progress` `{ done, total }` e `backup-error` `{ message }` (archivio bloccato,
-//! ma checkpoint o snapshot non salvati: va mostrato un avviso).
+//! ma checkpoint o snapshot non salvati: va mostrato un avviso), `maintenance-report`
+//! (esito della manutenzione dopo lo sblocco: `failedFiles > 0` va segnalato) e
+//! `maintenance-error` `{ message }`.
 //!
 //! Upload: il frontend NON legge i file in JavaScript. Ottiene i percorsi dal drag-and-drop
 //! nativo (`getCurrentWebview().onDragDropEvent`) o da `open()` di `@tauri-apps/plugin-dialog`
@@ -65,9 +67,17 @@ where
 }
 
 /// Dopo ogni sblocco: quarantena orfani e purge del cestino, senza bloccare nessuno.
-fn spawn_maintenance(core: Arc<AppCore>) {
-    tauri::async_runtime::spawn_blocking(move || {
-        let _ = core.maintenance();
+/// L'esito arriva al frontend come evento; un blocco nel frattempo non è un errore.
+fn spawn_maintenance(app: AppHandle, core: Arc<AppCore>) {
+    tauri::async_runtime::spawn_blocking(move || match core.maintenance() {
+        Ok(report) => {
+            let _ = app.emit("maintenance-report", report);
+        }
+        Err(e) if e.code == ErrorCode::Locked => {}
+        Err(e) => {
+            eprintln!("[dms] manutenzione: {}", e.message);
+            let _ = app.emit("maintenance-error", BackupErrorPayload { message: e.message });
+        }
     });
 }
 
@@ -86,11 +96,11 @@ pub async fn setup_vault(core: Core<'_>, password: String) -> Res<UnlockInfo> {
 }
 
 #[tauri::command]
-pub async fn unlock(core: Core<'_>, password: String) -> Res<UnlockInfo> {
+pub async fn unlock(app: AppHandle, core: Core<'_>, password: String) -> Res<UnlockInfo> {
     let core = core.inner().clone();
     let c2 = core.clone();
     let info = blocking(move || core.unlock(&password)).await?;
-    spawn_maintenance(c2);
+    spawn_maintenance(app, c2);
     Ok(info)
 }
 
@@ -229,6 +239,18 @@ pub async fn export_patient_zip(core: Core<'_>, patient_id: String, dest_path: S
     blocking(move || core.export_patient_zip(&patient_id, Path::new(&dest_path))).await
 }
 
+/// Registro degli accessi in CSV. Date facoltative `YYYY-MM-DD` (giorni locali), estremi inclusi.
+#[tauri::command]
+pub async fn export_audit_csv(
+    core: Core<'_>,
+    dest_path: String,
+    date_from: Option<String>,
+    date_to: Option<String>,
+) -> Res<AuditExportDto> {
+    let core = core.inner().clone();
+    blocking(move || core.export_audit_csv(Path::new(&dest_path), date_from.as_deref(), date_to.as_deref())).await
+}
+
 #[tauri::command]
 pub async fn run_maintenance(core: Core<'_>) -> Res<MaintenanceReport> {
     let core = core.inner().clone();
@@ -299,6 +321,7 @@ pub fn run() {
             upload_documents,
             open_document,
             export_patient_zip,
+            export_audit_csv,
             run_maintenance,
         ])
         .build(tauri::generate_context!())

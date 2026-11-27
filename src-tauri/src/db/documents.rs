@@ -75,14 +75,20 @@ impl Db {
     }
 
     /// Elimina definitivamente ciò che è nel cestino da più di `retention_days`.
-    /// Ripetibile: per ogni documento prima si rimuove il file (`remove_file` riceve
-    /// solo `<uuid>.enc`; "non trovato" conta come riuscito), poi la riga. Se la
-    /// rimozione fallisce la riga resta e si riprova alla prossima esecuzione. I
-    /// pazienti si eliminano solo quando non hanno più documenti. L'audit non si tocca.
+    /// Per ogni documento, in tre passi:
+    /// 1. `stage(nome)` mette da parte il file (riceve solo `<uuid>.enc`): `Ok(true)` se
+    ///    spostato, `Ok(false)` se già assente, `Err` se non spostabile (la riga resta e si
+    ///    riprova alla prossima esecuzione);
+    /// 2. una transazione cancella la riga e registra PURGE_FILE;
+    /// 3. `finish(nome, spostato, confermato)` cancella il file messo da parte se la
+    ///    transazione è riuscita, altrimenti lo rimette al suo posto.
+    /// Così un errore del database non lascia mai una riga senza file. I pazienti si
+    /// eliminano solo quando non hanno più documenti. L'audit non si tocca.
     pub fn purge_expired(
         &self,
         retention_days: u32,
-        mut remove_file: impl FnMut(&str) -> io::Result<()>,
+        mut stage: impl FnMut(&str) -> io::Result<bool>,
+        mut finish: impl FnMut(&str, bool, bool),
     ) -> Result<PurgeReport> {
         let modifier = format!("-{retention_days} days");
         let mut report = PurgeReport::default();
@@ -97,15 +103,16 @@ impl Db {
             rows.collect::<rusqlite::Result<_>>()?
         };
         for (id, path) in docs {
-            match remove_file(&path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            let staged = match stage(&path) {
+                Ok(s) => s,
                 Err(_) => { report.failed_files += 1; continue; }
-            }
-            self.tx(|c| {
+            };
+            let r = self.tx(|c| {
                 c.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
                 self.audit_append(c, "PURGE_FILE", Some(&id), None)
-            })?;
+            });
+            finish(&path, staged, r.is_ok());
+            r?;
             report.documents += 1;
         }
 

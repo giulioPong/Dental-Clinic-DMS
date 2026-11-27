@@ -2,6 +2,42 @@
 //! (upload, viewer, export, manutenzione) su una connessione propria.
 
 use super::*;
+use std::cell::Cell;
+use std::io::Read;
+
+/// Ogni quanti byte letti l'upload ricontrolla che la sessione sia ancora aperta.
+const UPLOAD_CHECK_EVERY: u64 = 8 * 1024 * 1024;
+
+/// Sorgente dell'upload: impone un tetto ai byte letti DAVVERO (il file può crescere dopo
+/// il controllo della dimensione) e ogni `UPLOAD_CHECK_EVERY` verifica la sessione. Il
+/// motivo dell'interruzione finisce in `stop`, perché l'errore di I/O lo perde.
+struct GuardedReader<'a, R> {
+    inner: R,
+    read: u64,
+    limit: u64,
+    next_check: u64,
+    alive: &'a dyn Fn() -> bool,
+    stop: &'a Cell<Option<ErrorCode>>,
+}
+
+impl<R: Read> Read for GuardedReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.read >= self.next_check {
+            if !(self.alive)() {
+                self.stop.set(Some(ErrorCode::Locked));
+                return Err(std::io::Error::other("archivio bloccato durante l'import"));
+            }
+            self.next_check = self.read + UPLOAD_CHECK_EVERY;
+        }
+        let n = self.inner.read(buf)?;
+        self.read += n as u64;
+        if self.read > self.limit {
+            self.stop.set(Some(ErrorCode::TooLarge));
+            return Err(std::io::Error::other("limite di dimensione superato"));
+        }
+        Ok(n)
+    }
+}
 
 impl AppCore {
     pub fn list_documents(&self, patient_id: &str, tag: Option<&str>) -> Res<Vec<DocumentDto>> {
@@ -46,22 +82,28 @@ impl AppCore {
         mut on_progress: impl FnMut(usize, usize),
     ) -> Res<UploadReport> {
         let _op = self.begin_op();
-        let keys = self.auth()?;
+        let (keys, epoch) = self.op_session()?;
         let db = self.heavy_db(&keys)?;
         let mut report = UploadReport::default();
         let files = self.collect_files(paths, &mut report.failed)?;
         let total = files.len();
+        let total_bytes: u64 = files.iter().filter_map(|p| fs::metadata(p).ok()).map(|m| m.len()).sum();
+        if total_bytes > MAX_UPLOAD_BATCH_BYTES {
+            return Err(CommandError::new(ErrorCode::TooLarge, "Import troppo grande (massimo 20 GB per operazione): dividilo in più parti."));
+        }
+        let mut budget = MAX_UPLOAD_BATCH_BYTES;
 
         for (i, path) in files.iter().enumerate() {
             let name = display_name(path);
-            if let Err(e) = self.auth() {
+            let session = self.auth().and_then(|_| if self.still_current(epoch) { Ok(()) } else { Err(CommandError::locked()) });
+            if let Err(e) = session {
                 // archivio bloccato a metà: i file restanti non vengono importati
                 for rest in &files[i..] {
                     report.failed.push(UploadFailure { name: display_name(rest), code: e.code, message: e.message.clone() });
                 }
                 break;
             }
-            match self.upload_one(&db, &keys, patient_id, path, &name, category_tag) {
+            match self.upload_one(&db, &keys, patient_id, path, &name, category_tag, epoch, &mut budget) {
                 Ok(id) => report.uploaded.push(UploadedDto { id, name }),
                 Err(e) => report.failed.push(UploadFailure { name, code: e.code, message: e.message }),
             }
@@ -70,14 +112,37 @@ impl AppCore {
         Ok(report)
     }
 
-    pub(super) fn upload_one(&self, db: &Db, keys: &Keys, patient_id: &str, path: &Path, name: &str, tag: &str) -> Res<String> {
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn upload_one(
+        &self, db: &Db, keys: &Keys, patient_id: &str, path: &Path, name: &str, tag: &str,
+        epoch: u64, budget: &mut u64,
+    ) -> Res<String> {
         let file = File::open(path).map_err(|_| CommandError::new(ErrorCode::IoError, "File non leggibile."))?;
         let len = file.metadata().map_err(|_| CommandError::new(ErrorCode::IoError, "File non leggibile."))?.len();
         if len > MAX_UPLOAD_FILE_BYTES {
             return Err(CommandError::new(ErrorCode::TooLarge, "File troppo grande (massimo 4 GB)."));
         }
         let req = UploadRequest { patient_id, original_filename: name, mime_type: mime_for(name), category_tag: tag };
-        Ok(self.storage.upload_document(db, keys, &req, BufReader::new(file))?)
+        let stop = Cell::new(None);
+        let alive = || self.still_current(epoch);
+        let mut reader = GuardedReader {
+            inner: BufReader::new(file),
+            read: 0,
+            limit: MAX_UPLOAD_FILE_BYTES.min(*budget),
+            next_check: 0,
+            alive: &alive,
+            stop: &stop,
+        };
+        let r = self.storage.upload_document(db, keys, &req, &mut reader);
+        *budget = budget.saturating_sub(reader.read);
+        r.map_err(|e| match stop.get() {
+            Some(ErrorCode::Locked) => CommandError::locked(),
+            Some(ErrorCode::TooLarge) => CommandError::new(
+                ErrorCode::TooLarge,
+                "File troppo grande, cresciuto durante l'import o oltre il limite dell'operazione.",
+            ),
+            _ => e.into(),
+        })
     }
 
     pub(super) fn collect_files(&self, paths: &[String], failures: &mut Vec<UploadFailure>) -> Res<Vec<PathBuf>> {
@@ -114,13 +179,26 @@ impl AppCore {
                 fail(ErrorCode::InvalidInput, "Cartella troppo annidata: ignorata.");
                 return Ok(());
             }
-            let mut children: Vec<PathBuf> = match fs::read_dir(path) {
-                Ok(rd) => rd.filter_map(|e| e.ok().map(|e| e.path())).collect(),
+            let mut children: Vec<PathBuf> = Vec::new();
+            let mut unreadable = 0usize;
+            match fs::read_dir(path) {
+                Ok(rd) => {
+                    for e in rd {
+                        match e {
+                            Ok(e) => children.push(e.path()),
+                            Err(_) => unreadable += 1,
+                        }
+                    }
+                }
                 Err(_) => {
                     fail(ErrorCode::IoError, "Cartella non leggibile.");
                     return Ok(());
                 }
-            };
+            }
+            if unreadable > 0 {
+                // la cartella si importa comunque, ma va detto che qualcosa è rimasto fuori
+                fail(ErrorCode::IoError, &format!("{unreadable} elementi della cartella non leggibili: non importati."));
+            }
             children.sort();
             for child in children {
                 if is_ignored_child(&display_name(&child)) {
@@ -133,6 +211,8 @@ impl AppCore {
                 return Err(CommandError::invalid("Troppi file in una sola operazione (massimo 5000)."));
             }
             out.push(path.to_path_buf());
+        } else {
+            fail(ErrorCode::InvalidInput, "Elemento non supportato (né file né cartella): ignorato.");
         }
         Ok(())
     }
@@ -140,9 +220,10 @@ impl AppCore {
     /// Viewer: decifra in RAM (limite `viewer_limit`), registra OPEN_FILE.
     pub fn open_document(&self, id: &str) -> Res<(DocumentDto, Zeroizing<Vec<u8>>)> {
         let _op = self.begin_op();
-        let keys = self.auth()?;
+        let (keys, epoch) = self.op_session()?;
         let db = self.heavy_db(&keys)?;
-        let (rec, bytes) = self.storage.open_document(&db, &keys, id, self.viewer_limit)?;
+        let (rec, bytes) =
+            self.storage.open_document_checked(&db, &keys, id, self.viewer_limit, &|| self.still_current(epoch))?;
         Ok((rec.into(), bytes))
     }
 
@@ -150,23 +231,10 @@ impl AppCore {
     /// non dentro il vault (finirebbe nel raggio del backup).
     pub fn export_patient_zip(&self, patient_id: &str, dest: &Path) -> Res<ExportDto> {
         let _op = self.begin_op();
-        let keys = self.auth()?;
-        let is_zip = dest.extension().map(|e| e.eq_ignore_ascii_case("zip")).unwrap_or(false);
-        if !is_zip {
-            return Err(CommandError::invalid("Il file di destinazione deve avere estensione .zip."));
-        }
-        let parent = match dest.parent() {
-            Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
-            _ => PathBuf::from("."),
-        };
-        let parent_canon = fs::canonicalize(&parent).map_err(|_| CommandError::invalid("La cartella di destinazione non esiste."))?;
-        if let Ok(vault) = fs::canonicalize(&self.vault_dir) {
-            if parent_canon.starts_with(&vault) {
-                return Err(CommandError::invalid("Scegli una cartella fuori dall'archivio."));
-            }
-        }
+        let (keys, epoch) = self.op_session()?;
+        check_export_dest(&self.vault_dir, dest, "zip")?;
         let db = self.heavy_db(&keys)?;
-        let r = self.storage.export_patient_zip(&db, &keys, patient_id, dest)?;
+        let r = self.storage.export_patient_zip_checked(&db, &keys, patient_id, dest, &|| self.still_current(epoch))?;
         Ok(ExportDto { documents: r.documents, plain_bytes: r.plain_bytes })
     }
 

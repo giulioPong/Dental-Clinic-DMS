@@ -73,8 +73,18 @@ impl Storage {
 
     /// Viewer: decifra in RAM (mai su disco), verifica dimensione e SHA-256 contro il
     /// DB e registra OPEN_FILE. Se l'audit non si scrive, non restituisce i dati.
+    #[cfg(test)]
     pub fn open_document(
         &self, db: &Db, keys: &Keys, doc_id: &str, max_bytes: usize,
+    ) -> Result<(DocumentRecord, Zeroizing<Vec<u8>>)> {
+        self.open_document_checked(db, keys, doc_id, max_bytes, &|| true)
+    }
+
+    /// Come `open_document`; se `proceed()` è falso dopo la decifratura (archivio bloccato
+    /// nel frattempo) il buffer viene azzerato, l'audit non viene scritto e si restituisce
+    /// `Cancelled`.
+    pub fn open_document_checked(
+        &self, db: &Db, keys: &Keys, doc_id: &str, max_bytes: usize, proceed: &dyn Fn() -> bool,
     ) -> Result<(DocumentRecord, Zeroizing<Vec<u8>>)> {
         let rec = db.get_document(doc_id)?;
         if rec.deleted_at.is_some() {
@@ -89,6 +99,9 @@ impl Storage {
         let plain = crypto::decrypt_to_vec(keys.files_key(), &rec.id, f, max_bytes, hint)?;
         if plain.len() as u64 != rec.size_bytes || hex(&Sha256::digest(&plain[..])) != rec.sha256 {
             return Err(StorageError::IntegrityMismatch(rec.id.clone()));
+        }
+        if !proceed() {
+            return Err(StorageError::Cancelled); // `plain` è Zeroizing: azzerato alla drop
         }
         db.log_audit("OPEN_FILE", Some(&rec.id), None)?;
         Ok((rec, plain))

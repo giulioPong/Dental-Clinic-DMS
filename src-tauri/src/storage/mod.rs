@@ -83,6 +83,7 @@ impl Storage {
     pub fn open(root: &Path) -> Result<Storage> {
         fs::create_dir_all(root.join("tmp"))?;
         fs::create_dir_all(root.join("quarantine"))?;
+        fs::create_dir_all(root.join("purging"))?;
         let s = Storage { root: root.to_path_buf(), upload_lock: RwLock::new(()) };
         for entry in fs::read_dir(s.tmp_dir())? {
             let p = entry?.path();
@@ -99,6 +100,7 @@ impl Storage {
     }
     fn tmp_dir(&self) -> PathBuf { self.root.join("tmp") }
     fn quarantine_dir(&self) -> PathBuf { self.root.join("quarantine") }
+    fn purging_dir(&self) -> PathBuf { self.root.join("purging") }
     fn enc_path(&self, doc_id: &str) -> PathBuf { self.root.join(format!("{doc_id}.enc")) }
     fn meta_path(&self) -> PathBuf { self.root.join("vault.meta") }
     fn meta_tmp(&self) -> PathBuf { self.root.join("vault.meta.tmp") }

@@ -15,6 +15,26 @@ pub struct UnlockInfo {
     /// `false` se il registro degli accessi non coincide con l'ultimo checkpoint salvato.
     pub audit_ok: bool,
     pub audit_message: Option<String>,
+    /// Prima riga del registro dove la verifica fallisce, per il banner di allerta.
+    pub audit_row_id: Option<i64>,
+}
+
+impl UnlockInfo {
+    pub(super) fn ok() -> Self {
+        UnlockInfo { audit_ok: true, audit_message: None, audit_row_id: None }
+    }
+    pub(super) fn warn(message: impl Into<String>, row_id: Option<i64>) -> Self {
+        UnlockInfo { audit_ok: false, audit_message: Some(message.into()), audit_row_id: row_id }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditExportDto {
+    pub rows: u32,
+    /// Esito della verifica della catena al momento dell'export.
+    pub audit_ok: bool,
+    pub audit_message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -485,3 +485,85 @@ fn nomi_enc_validi() {
         assert!(!is_enc_name(bad), "{bad}");
     }
 }
+
+#[test]
+fn purge_con_errore_del_database_rimette_il_file_al_suo_posto() {
+    let (dir, st, db, keys) = setup();
+    let pid = db.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let old = up(&st, &db, &keys, &pid, "vecchio.jpg", "Altro", &data(500));
+    db.soft_delete_document(&old).unwrap();
+    db.conn()
+        .execute(
+            "UPDATE documents SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-40 days') WHERE id = ?1",
+            rusqlite::params![old],
+        )
+        .unwrap();
+    // la transazione di purge fallisce
+    db.conn()
+        .execute_batch("CREATE TRIGGER blocca_purge BEFORE DELETE ON documents BEGIN SELECT RAISE(ABORT, 'disco pieno'); END;")
+        .unwrap();
+    assert!(st.purge_expired(&db, 30).is_err());
+    assert!(st.enc_path(&old).exists(), "il file deve tornare al suo posto");
+    assert!(files_in(&st.purging_dir()).is_empty());
+    assert_eq!(st.check_consistency(&db).unwrap(), ConsistencyReport::default());
+
+    // risolto il problema, il purge successivo va a buon fine
+    db.conn().execute_batch("DROP TRIGGER blocca_purge;").unwrap();
+    assert_eq!(st.purge_expired(&db, 30).unwrap().documents, 1);
+    assert!(!st.enc_path(&old).exists());
+    assert!(files_in(&st.purging_dir()).is_empty());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn purge_interrotto_si_recupera_alla_volta_successiva() {
+    let (dir, st, db, keys) = setup();
+    let pid = db.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    // crash dopo lo spostamento ma PRIMA del commit: la riga c'è ancora → il file torna
+    let alive = up(&st, &db, &keys, &pid, "ancora.jpg", "Altro", &data(500));
+    fs::rename(st.enc_path(&alive), st.purging_dir().join(format!("{alive}.enc"))).unwrap();
+    // crash DOPO il commit: la riga non c'è più → il file si cancella
+    let gone = new_uuid();
+    fs::write(st.purging_dir().join(format!("{gone}.enc")), b"resto").unwrap();
+    // altro nella cartella: non si tocca
+    fs::write(st.purging_dir().join("leggimi.txt"), b"x").unwrap();
+
+    assert_eq!(st.purge_expired(&db, 30).unwrap(), PurgeReport::default());
+    assert!(st.enc_path(&alive).exists());
+    assert_eq!(files_in(&st.purging_dir()), vec!["leggimi.txt".to_string()]);
+    assert_eq!(st.open_document(&db, &keys, &alive, 1 << 20).unwrap().1.len(), 500);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn viewer_ed_export_non_consegnano_nulla_se_la_sessione_finisce() {
+    let (dir, st, db, keys) = setup();
+    let pid = db.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let id = up(&st, &db, &keys, &pid, "rx.jpg", "Panoramica", &data(5000));
+    up(&st, &db, &keys, &pid, "rx2.jpg", "Panoramica", &data(5000));
+    let opens = || -> i64 {
+        db.conn().query_row("SELECT count(*) FROM audit_log WHERE action = 'OPEN_FILE'", [], |r| r.get(0)).unwrap()
+    };
+    assert!(matches!(st.open_document_checked(&db, &keys, &id, 1 << 20, &|| false), Err(StorageError::Cancelled)));
+    assert_eq!(opens(), 0); // niente OPEN_FILE per un documento non consegnato
+
+    // l'archivio si blocca dopo il primo documento dello ZIP
+    let calls = std::cell::Cell::new(0);
+    let dest = dir.join("export.zip");
+    let r = st.export_patient_zip_checked(&db, &keys, &pid, &dest, &|| {
+        calls.set(calls.get() + 1);
+        calls.get() <= 1
+    });
+    assert!(matches!(r, Err(StorageError::Cancelled)));
+    assert!(!dest.exists());
+    assert!(files_in(&dir).iter().all(|n| !n.ends_with(".part")));
+    // ...e anche se si blocca solo alla fine, prima del rename
+    let calls = std::cell::Cell::new(0);
+    let r = st.export_patient_zip_checked(&db, &keys, &pid, &dest, &|| {
+        calls.set(calls.get() + 1);
+        calls.get() <= 2
+    });
+    assert!(matches!(r, Err(StorageError::Cancelled)));
+    assert!(!dest.exists());
+    fs::remove_dir_all(dir).ok();
+}

@@ -33,15 +33,23 @@ impl AppCore {
         self.with_db(|db| db.update_patient(id, first, last, birth, fiscal_code, notes))
     }
 
-    /// Apre la scheda: registra VIEW_PATIENT, e se l'audit non si scrive non restituisce i dati.
+    /// Apertura esplicita della scheda: registra VIEW_PATIENT (al massimo una volta ogni
+    /// `view_audit_interval` per paziente e sessione), e se l'audit non si scrive non
+    /// restituisce i dati.
     pub fn get_patient(&self, id: &str) -> Res<PatientDto> {
-        self.with_db(|db| {
-            let p = db.get_patient(id)?;
-            db.log_audit("VIEW_PATIENT", Some(id), None)?;
-            Ok(PatientDto {
-                id: p.id, first_name: p.first_name, last_name: p.last_name, birth_date: p.birth_date,
-                fiscal_code: p.fiscal_code, notes: p.notes, created_at: p.created_at, in_trash: p.deleted_at.is_some(),
-            })
+        let _keys = self.auth()?;
+        let mut g = self.lock_session();
+        let s = g.as_mut().ok_or_else(CommandError::locked)?;
+        let p = s.db.get_patient(id)?;
+        let now = Instant::now();
+        let recent = s.views.get(&p.id).is_some_and(|t| now.duration_since(*t) < self.view_audit_interval);
+        if !recent {
+            s.db.log_audit("VIEW_PATIENT", Some(&p.id), None)?;
+            s.views.insert(p.id.clone(), now);
+        }
+        Ok(PatientDto {
+            id: p.id, first_name: p.first_name, last_name: p.last_name, birth_date: p.birth_date,
+            fiscal_code: p.fiscal_code, notes: p.notes, created_at: p.created_at, in_trash: p.deleted_at.is_some(),
         })
     }
 

@@ -79,7 +79,16 @@ impl Storage {
     /// `YYYY-MM-DD_Tag_NomeFile`. Costruito in `<dest>.part` accanto alla destinazione e
     /// rinominato solo a lavoro finito; se un solo file fallisce (anche per un troncamento
     /// scoperto all'ultimo blocco) il `.part` viene cancellato.
+    #[cfg(test)]
     pub fn export_patient_zip(&self, db: &Db, keys: &Keys, patient_id: &str, dest: &Path) -> Result<ExportReport> {
+        self.export_patient_zip_checked(db, keys, patient_id, dest, &|| true)
+    }
+
+    /// Come `export_patient_zip`; `proceed()` si controlla prima di ogni documento e prima
+    /// di rinominare il `.part`: se l'archivio è stato bloccato lo ZIP non viene consegnato.
+    pub fn export_patient_zip_checked(
+        &self, db: &Db, keys: &Keys, patient_id: &str, dest: &Path, proceed: &dyn Fn() -> bool,
+    ) -> Result<ExportReport> {
         if dest.exists() {
             return Err(StorageError::DestinationExists);
         }
@@ -103,6 +112,9 @@ impl Storage {
             let mut used = HashSet::new();
             let mut total = 0u64;
             for d in &docs {
+                if !proceed() {
+                    return Err(StorageError::Cancelled);
+                }
                 let name = unique_name(&mut used, export_entry_name(d));
                 let opts = FileOptions::default()
                     .compression_method(compression_for(&name))
@@ -122,6 +134,9 @@ impl Storage {
             let file = w.into_inner().map_err(|e| e.into_error())?;
             file.sync_all()?;
             drop(file);
+            if !proceed() {
+                return Err(StorageError::Cancelled);
+            }
             rename_no_clobber(&part, dest)?;
             if let Some(parent) = dest.parent().filter(|p| !p.as_os_str().is_empty()) {
                 let _ = sync_dir(parent); // solo durabilità: non deve far fallire un export già completo

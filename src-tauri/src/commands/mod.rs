@@ -23,6 +23,11 @@
 //! scrive uno snapshot consistente e cifrato in `snapshot_dir` (alla chiusura della sessione
 //! e periodicamente), e restic/borg salvano quella cartella + `vault/` (con `vault.meta`).
 //! Limite: se l'app resta chiusa per giorni, lo snapshot è quello dell'ultima chiusura.
+//!
+//! Ripristino: `snapshot_dir/gestionale.db` → percorso del DB, `snapshot_dir/audit.checkpoint`
+//! → `vault/audit.checkpoint`, e la cartella `vault/` (con `vault.meta` e i `.enc`) dal backup.
+//! Il checkpoint va preso dalla cartella dello snapshot, non da `vault/`: quello di `vault/`
+//! può essere più recente dello snapshot e farebbe sembrare il log troncato.
 
 pub mod tauri_api;
 
@@ -30,9 +35,11 @@ use crate::crypto::{CryptoError, KdfParams, KeyStore, Keys};
 use crate::db::{AuditCheckpoint, Db, DbError, DocumentRecord};
 use crate::storage::{Storage, StorageError, UploadRequest};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use zeroize::Zeroizing;
@@ -43,6 +50,7 @@ mod util;
 mod throttle;
 mod patients;
 mod documents;
+mod audit;
 
 pub use dto::*;
 pub use error::*;
@@ -55,6 +63,8 @@ pub const MAX_SEARCH_RESULTS: u32 = 100;
 pub const MAX_QUERY_CHARS: usize = 200;
 pub const MAX_UPLOAD_FILE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub const MAX_FILES_PER_UPLOAD: usize = 5000;
+/// Tetto complessivo di un singolo import (somma delle dimensioni).
+pub const MAX_UPLOAD_BATCH_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const MAX_DIR_DEPTH: usize = 10;
 const MAX_NAME_CHARS: usize = 100;
 const MAX_NOTES_CHARS: usize = 10_000;
@@ -63,12 +73,17 @@ const ORPHAN_MIN_AGE: Duration = Duration::from_secs(300);
 const THROTTLE_FREE_ATTEMPTS: u32 = 5;
 const THROTTLE_BASE_SECS: u64 = 30;
 const THROTTLE_MAX_SECS: u64 = 300;
+/// VIEW_PATIENT al massimo una volta in questo intervallo per paziente e sessione: riaprire
+/// o ricaricare la stessa scheda non riempie il registro.
+const VIEW_AUDIT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 // ───────── Stato applicativo ─────────
 
 struct Session {
     db: Db,
     keys: Keys,
+    /// Ultimo VIEW_PATIENT registrato per paziente (si azzera al blocco).
+    views: HashMap<String, Instant>,
 }
 
 pub struct AppCore {
@@ -82,8 +97,12 @@ pub struct AppCore {
     /// Operazioni pesanti in corso (ognuna con chiavi e connessione proprie).
     ops: Mutex<usize>,
     ops_done: Condvar,
+    /// Numero della sessione: cambia a ogni sblocco. Un'operazione pesante lo legge all'inizio
+    /// e non consegna risultati se nel frattempo la sessione è stata chiusa (o sostituita).
+    epoch: AtomicU64,
     kdf: KdfParams,
     viewer_limit: usize,
+    view_audit_interval: Duration,
 }
 
 struct OpGuard<'a>(&'a AppCore);
@@ -108,11 +127,13 @@ impl AppCore {
             storage,
             keystore: KeyStore::new(idle_timeout),
             session: Mutex::new(None),
-            throttle: Mutex::new(Throttle::default()),
+            throttle: Mutex::new(Throttle::load(vault_dir.join(THROTTLE_FILE))),
             ops: Mutex::new(0),
             ops_done: Condvar::new(),
+            epoch: AtomicU64::new(0),
             kdf: KdfParams::DEFAULT,
             viewer_limit: MAX_VIEWER_BYTES,
+            view_audit_interval: VIEW_AUDIT_INTERVAL,
         })
     }
 
@@ -127,6 +148,10 @@ impl AppCore {
     }
     pub fn with_viewer_limit(mut self, bytes: usize) -> Self {
         self.viewer_limit = bytes;
+        self
+    }
+    pub fn with_view_audit_interval(mut self, d: Duration) -> Self {
+        self.view_audit_interval = d;
         self
     }
 
@@ -168,8 +193,13 @@ impl AppCore {
                 return Err(e.into());
             }
         };
+        // checkpoint subito: da qui in poi un checkpoint mancante è un'anomalia
+        let cp = self.write_checkpoint(&db);
         self.start_session(keys, db);
-        Ok(UnlockInfo { audit_ok: true, audit_message: None })
+        Ok(match cp {
+            Ok(()) => UnlockInfo::ok(),
+            Err(e) => UnlockInfo::warn(e.message, None),
+        })
     }
 
     pub fn unlock(&self, password: &str) -> Res<UnlockInfo> {
@@ -190,8 +220,9 @@ impl AppCore {
     }
 
     fn start_session(&self, keys: Keys, db: Db) {
+        self.epoch.fetch_add(1, Ordering::SeqCst);
         self.keystore.unlock(keys.clone());
-        *self.lock_session() = Some(Session { db, keys });
+        *self.lock_session() = Some(Session { db, keys, views: HashMap::new() });
     }
 
     /// Blocco manuale. Azzera le chiavi, chiude la connessione, salva checkpoint e snapshot.
@@ -294,6 +325,18 @@ impl AppCore {
         Ok(f(&s.db)?)
     }
 
+    /// Chiavi e numero di sessione per un'operazione pesante.
+    fn op_session(&self) -> Res<(Keys, u64)> {
+        let keys = self.auth()?;
+        Ok((keys, self.epoch.load(Ordering::SeqCst)))
+    }
+
+    /// Vero finché è aperta la stessa sessione con cui l'operazione è partita. Non conta
+    /// come attività: non rinvia il blocco per inattività.
+    fn still_current(&self, epoch: u64) -> bool {
+        self.keystore.is_unlocked() && self.epoch.load(Ordering::SeqCst) == epoch
+    }
+
     /// Connessione propria per le operazioni lunghe.
     fn heavy_db(&self, keys: &Keys) -> Res<Db> {
         Ok(Db::open(&self.db_path, keys, ACTOR)?)
@@ -306,17 +349,26 @@ impl AppCore {
     }
 
     fn audit_info(&self, db: &Db) -> UnlockInfo {
-        let ok = UnlockInfo { audit_ok: true, audit_message: None };
         let cp = match fs::read_to_string(self.checkpoint_path()) {
             Ok(s) => match AuditCheckpoint::from_line(&s) {
                 Some(c) => Some(c),
-                None => return UnlockInfo { audit_ok: false, audit_message: Some("Checkpoint del registro accessi illeggibile.".into()) },
+                None => return UnlockInfo::warn("Checkpoint del registro accessi illeggibile.", None),
             },
-            Err(_) => None,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return UnlockInfo::warn("Checkpoint del registro accessi non leggibile.", None),
         };
         match db.verify_audit_chain(cp.as_ref()) {
-            Ok(_) => ok,
-            Err(e) => UnlockInfo { audit_ok: false, audit_message: Some(CommandError::from(e).message) },
+            Err(DbError::AuditTampered { row_id, reason }) => {
+                UnlockInfo::warn(format!("Registro degli accessi non coerente: {reason}"), row_id)
+            }
+            Err(e) => UnlockInfo::warn(CommandError::from(e).message, None),
+            // il checkpoint si scrive alla creazione: se manca e il log non è vuoto, qualcuno
+            // potrebbe averlo cancellato per nascondere un troncamento
+            Ok(n) if cp.is_none() && n > 0 => UnlockInfo::warn(
+                "Checkpoint del registro accessi mancante: un troncamento delle ultime righe non sarebbe rilevabile.",
+                None,
+            ),
+            Ok(_) => UnlockInfo::ok(),
         }
     }
 
@@ -326,7 +378,12 @@ impl AppCore {
         match self.storage.change_password(old_password, new_password) {
             Ok(()) => {
                 self.lock_throttle().reset();
-                Ok(()) // la master key non cambia: la sessione in corso resta valida
+                // la master key non cambia: la sessione in corso resta valida. L'audit si può
+                // scrivere solo dopo: la password è in vault.meta, fuori dal database.
+                self.with_db(|db| db.log_audit("CHANGE_PASSWORD", None, None)).map_err(|e| {
+                    CommandError::new(e.code, "Password cambiata, ma non è stato possibile registrarlo nel registro degli accessi.")
+                        .with_detail(e.message)
+                })
             }
             Err(StorageError::Crypto(CryptoError::WrongPasswordOrCorrupted)) => {
                 self.lock_throttle().fail();
