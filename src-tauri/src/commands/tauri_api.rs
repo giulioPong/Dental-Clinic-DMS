@@ -29,6 +29,7 @@
 //! copie nella WebView non sono controllabili da qui.
 
 use super::*;
+use crate::backup::{default_data_dir, InstanceLock, DB_FILE, STAGING_DIR, VAULT_DIR};
 use std::sync::Arc;
 use tauri::ipc::Response;
 use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
@@ -38,6 +39,8 @@ type Core<'a> = State<'a, Arc<AppCore>>;
 const IDLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const WATCH_INTERVAL: Duration = Duration::from_secs(5);
 const SNAPSHOT_EVERY_TICKS: u32 = 360; // 30 minuti
+/// All'avvio: attesa massima del lock di istanza (il backup notturno lo tiene pochi istanti).
+const INSTANCE_LOCK_WAIT: Duration = Duration::from_secs(30);
 /// Alla chiusura: attesa massima delle operazioni pesanti prima dello snapshot finale.
 const SHUTDOWN_WAIT: Duration = Duration::from_secs(30);
 
@@ -260,15 +263,38 @@ pub async fn run_maintenance(core: Core<'_>) -> Res<MaintenanceReport> {
 // ───────── avvio ─────────
 
 pub fn run() {
+    // Cartella dati e lock PRIMA di avviare Tauri: una seconda istanza termina subito, senza
+    // finestra. È la stessa cartella di `app_data_dir()` (stesso identificativo, vedi il test
+    // in `backup`) e quella che usa `--backup-db`.
+    let Some(dir) = default_data_dir() else {
+        eprintln!("[dms] cartella dati non determinabile");
+        std::process::exit(1);
+    };
+    if let Err(e) = fs::create_dir_all(&dir) {
+        eprintln!("[dms] cartella dati non accessibile: {e}");
+        std::process::exit(1);
+    }
+    let lock = match InstanceLock::acquire_for_app(&dir, INSTANCE_LOCK_WAIT) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            eprintln!("[dms] l'applicazione è già aperta");
+            return;
+        }
+        Err(e) => {
+            eprintln!("[dms] lock di istanza non accessibile: {e}");
+            std::process::exit(1);
+        }
+    };
+
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .setup(|app| {
-            let dir = app.path().app_data_dir()?;
-            fs::create_dir_all(&dir)?;
+        .setup(move |app| {
+            // tenuto per tutta la vita dell'app: `--backup-db` sa che il DB è in uso
+            app.manage(lock);
             let core = Arc::new(
-                AppCore::new(&dir.join("vault"), &dir.join("gestionale.db"), IDLE_TIMEOUT)?
-                    .with_snapshot_dir(&dir.join("backup-staging")),
+                AppCore::new(&dir.join(VAULT_DIR), &dir.join(DB_FILE), IDLE_TIMEOUT)?
+                    .with_snapshot_dir(&dir.join(STAGING_DIR)),
             );
             app.manage(core.clone());
 

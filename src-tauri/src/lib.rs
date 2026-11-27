@@ -1,4 +1,5 @@
 mod audit;
+pub mod backup;
 mod commands;
 mod crypto;
 mod db;

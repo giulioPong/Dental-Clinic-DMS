@@ -165,7 +165,7 @@ impl AppCore {
         self.vault_dir.join("vault.meta")
     }
     fn checkpoint_path(&self) -> PathBuf {
-        self.vault_dir.join("audit.checkpoint")
+        self.vault_dir.join(crate::backup::CHECKPOINT_FILE)
     }
 
     // ───── ciclo di vita ─────

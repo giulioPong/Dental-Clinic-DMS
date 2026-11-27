@@ -81,5 +81,5 @@ pub(super) fn write_snapshot(db: &Db, keys: &Keys, dir: &Path) -> Res<()> {
         .map_err(|_| CommandError::new(ErrorCode::IoError, "Impossibile salvare il checkpoint dello snapshot."))
 }
 
-pub(super) const SNAPSHOT_DB: &str = "gestionale.db";
-pub(super) const SNAPSHOT_CHECKPOINT: &str = "audit.checkpoint";
+pub(super) const SNAPSHOT_DB: &str = crate::backup::DB_FILE;
+pub(super) const SNAPSHOT_CHECKPOINT: &str = crate::backup::CHECKPOINT_FILE;
