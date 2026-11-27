@@ -16,6 +16,9 @@ dist-ssr
 .env
 .env.*
 !.env.example
+vault.meta
+vault.meta.*
+audit.checkpoint
 
 # Databases and local data
 *.db*

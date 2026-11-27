@@ -473,6 +473,19 @@ pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Lunghezza attesa di un `.enc` per un file in chiaro di `plain_len` byte:
+/// permette di controllare `std::fs::metadata(..).len()` contro `documents.size_bytes`
+/// senza decifrare nulla. `chunk_size` si legge dal header del file (di default 1 MiB).
+pub fn encrypted_len(plain_len: u64, chunk_size: usize) -> u64 {
+    let cs = chunk_size as u64;
+    let chunks = if plain_len == 0 {
+        1
+    } else {
+        (plain_len + cs - 1) / cs
+    };
+    FH_LEN as u64 + plain_len + chunks * TAG_LEN as u64
+}
+
 fn file_aad(header: &[u8; FH_LEN], doc_id: &str) -> Vec<u8> {
     let mut aad = Vec::with_capacity(FH_LEN + doc_id.len());
     aad.extend_from_slice(header);
@@ -854,6 +867,42 @@ mod tests {
             assert_eq!(info.size_bytes, n as u64);
             assert_eq!(info.sha256.to_vec(), Sha256::digest(&d).to_vec());
             assert_eq!(dec(&fkey(), "doc-A", &ct).unwrap(), d, "n = {n}");
+        }
+    }
+
+    #[test]
+    fn file_pdf_e_jpg_di_testo_roundtrip_binario() {
+        let fixtures: [(&str, &[u8]); 2] = [
+            (
+                "test.pdf",
+                b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n%%EOF\n",
+            ),
+            (
+                "test.jpg",
+                &[
+                    0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10, b'J', b'F', b'I', b'F', 0x00, 0x00, 0xff,
+                    0xd9,
+                ],
+            ),
+        ];
+
+        for (index, (name, plain)) in fixtures.into_iter().enumerate() {
+            let doc_id = format!("test-document-{index}");
+            let (encrypted, info) = enc(&fkey(), &doc_id, plain, 4096);
+            let expected_sha: [u8; 32] = Sha256::digest(plain).into();
+
+            assert_ne!(encrypted, plain, "{name}");
+            assert_eq!(info.size_bytes, plain.len() as u64, "{name}");
+            assert_eq!(info.sha256, expected_sha, "{name}");
+            assert_eq!(dec(&fkey(), &doc_id, &encrypted).unwrap(), plain, "{name}");
+        }
+    }
+
+    #[test]
+    fn encrypted_len_coincide_con_la_lunghezza_reale() {
+        for n in [0usize, 1, 4095, 4096, 4097, 8192, 10_000] {
+            let (ct, _) = enc(&fkey(), "doc-A", &data(n), 4096);
+            assert_eq!(ct.len() as u64, encrypted_len(n as u64, 4096), "n = {n}");
         }
     }
 
