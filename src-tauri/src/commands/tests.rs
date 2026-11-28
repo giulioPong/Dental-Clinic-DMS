@@ -1,0 +1,919 @@
+use super::*;
+
+const PW: &str = "correct horse battery";
+
+fn data(n: usize) -> Vec<u8> {
+    (0..n).map(|i| (i % 251) as u8).collect()
+}
+fn tmpdir() -> PathBuf {
+    let d = std::env::temp_dir().join(format!("gestionale-cmd-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&d).unwrap();
+    d
+}
+fn core_with(idle: Duration) -> (PathBuf, AppCore) {
+    let dir = tmpdir();
+    let c = AppCore::new(&dir.join("vault"), &dir.join("gestionale.db"), idle)
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 });
+    (dir, c)
+}
+fn core() -> (PathBuf, AppCore) {
+    core_with(Duration::from_secs(600))
+}
+fn s(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+fn code<T: std::fmt::Debug>(r: Res<T>) -> ErrorCode {
+    r.unwrap_err().code
+}
+fn audit_actions(c: &AppCore) -> Vec<String> {
+    let g = c.lock_session();
+    let db = &g.as_ref().expect("sessione aperta").db;
+    let mut st = db.conn().prepare("SELECT action FROM audit_log ORDER BY id").unwrap();
+    st.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<Vec<String>>>().unwrap()
+}
+fn count(actions: &[String], a: &str) -> usize {
+    actions.iter().filter(|x| *x == a).count()
+}
+
+#[test]
+fn flusso_completo_e_sblocco_successivo() {
+    let (dir, c) = core();
+    assert_eq!(c.status(), Status { initialized: false, unlocked: false });
+    assert_eq!(code(c.search_patients("ross", 10)), ErrorCode::Locked);
+
+    assert!(c.setup_vault(PW).unwrap().audit_ok);
+    assert_eq!(c.status(), Status { initialized: true, unlocked: true });
+    assert_eq!(code(c.setup_vault(PW)), ErrorCode::AlreadyInitialized);
+
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let f = dir.join("rx.jpg");
+    fs::write(&f, data(5000)).unwrap();
+    let mut progress = Vec::new();
+    let rep = c.upload_documents(&pid, &[s(&f)], "Panoramica", |d, t| progress.push((d, t))).unwrap();
+    assert_eq!((rep.uploaded.len(), rep.failed.len()), (1, 0));
+    assert_eq!(progress, vec![(1, 1)]);
+
+    let docs = c.list_documents(&pid, None).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(docs[0].mime_type, "image/jpeg");
+    let (meta, bytes) = c.open_document(&docs[0].id).unwrap();
+    assert_eq!(&bytes[..], &data(5000)[..]);
+    assert_eq!(meta.original_filename, "rx.jpg");
+
+    let zip = dir.join("out.zip");
+    assert_eq!(c.export_patient_zip(&pid, &zip).unwrap().documents, 1);
+    assert_eq!(c.get_patient(&pid).unwrap().last_name, "Rossi");
+
+    assert!(c.lock().unwrap());
+    assert_eq!(c.status(), Status { initialized: true, unlocked: false });
+    assert_eq!(code(c.open_document(&docs[0].id)), ErrorCode::Locked);
+    assert_eq!(code(c.unlock("password sbagliata")), ErrorCode::WrongPassword);
+    let info = c.unlock(PW).unwrap();
+    assert!(info.audit_ok, "{:?}", info.audit_message);
+    assert_eq!(c.search_patients("ross", 10).unwrap().len(), 1);
+
+    // l'audit è una catena unica anche se scritto da connessioni diverse
+    let keys = c.storage.unlock(PW).unwrap();
+    let db = Db::open(&c.db_path, &keys, "t").unwrap();
+    assert!(db.verify_audit_chain(None).unwrap() >= 5); // paziente, upload, apertura, export, vista
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn il_blocco_chiude_la_connessione_e_azzera_la_sessione() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    assert!(c.lock_session().is_some());
+    c.lock().unwrap();
+    assert!(c.lock_session().is_none());
+    assert!(!c.keystore.is_unlocked());
+    assert!(!c.lock().unwrap()); // già bloccato
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn blocco_per_inattivita_con_e_senza_watcher() {
+    let (dir, c) = core_with(Duration::from_millis(300));
+    c.setup_vault(PW).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(c.expire_if_idle().unwrap()); // il thread di fondo blocca e può emettere vault-locked
+    assert!(c.lock_session().is_none());
+    assert!(!c.expire_if_idle().unwrap());
+
+    c.unlock(PW).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    // senza watcher: il primo comando trova la sessione scaduta e la elimina
+    assert_eq!(code(c.search_patients("abc", 5)), ErrorCode::Locked);
+    assert!(c.lock_session().is_none());
+
+    c.unlock(PW).unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert_eq!(c.status().unlocked, false); // anche status() chiude la sessione scaduta
+    assert!(c.lock_session().is_none());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn lo_snapshot_periodico_non_rinvia_il_blocco() {
+    let dir = tmpdir();
+    let c = AppCore::new(&dir.join("vault"), &dir.join("g.db"), Duration::from_millis(400))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 })
+        .with_snapshot_dir(&dir.join("staging"));
+    c.setup_vault(PW).unwrap();
+    std::thread::sleep(Duration::from_millis(250));
+    c.snapshot_db().unwrap(); // non è attività dell'utente
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(c.expire_if_idle().unwrap()); // 500 ms dall'ultima attività vera, nonostante lo snapshot a 250
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn i_comandi_rinviano_il_blocco() {
+    let (dir, c) = core_with(Duration::from_millis(600));
+    c.setup_vault(PW).unwrap();
+    for _ in 0..4 {
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(c.search_patients("abc", 5).is_ok()); // ogni uso azzera il timer
+    }
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn tentativi_di_sblocco_limitati() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    c.lock().unwrap();
+    for _ in 0..4 {
+        assert_eq!(code(c.unlock("sbagliata sbagliata")), ErrorCode::WrongPassword);
+    }
+    assert!(c.unlock(PW).is_ok()); // dopo 4 errori la password giusta passa e azzera il contatore
+    c.lock().unwrap();
+    for _ in 0..5 {
+        assert_eq!(code(c.unlock("sbagliata sbagliata")), ErrorCode::WrongPassword);
+    }
+    let e = c.unlock(PW).unwrap_err(); // anche la password giusta viene rifiutata durante l'attesa
+    assert_eq!(e.code, ErrorCode::TooManyAttempts);
+    assert!(e.detail.unwrap().parse::<u64>().unwrap() >= 1);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cambio_password_dalla_sessione() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    assert_eq!(code(c.change_password("sbagliata sbagliata", "nuova password lunga")), ErrorCode::WrongPassword);
+    assert_eq!(code(c.change_password(PW, "corta")), ErrorCode::InvalidInput);
+    c.change_password(PW, "nuova password lunga").unwrap();
+    assert_eq!(count(&audit_actions(&c), "CHANGE_PASSWORD"), 1); // i tentativi falliti non contano
+    assert!(c.search_patients("abc", 5).is_ok()); // la sessione resta valida
+    c.lock().unwrap();
+    assert_eq!(code(c.unlock(PW)), ErrorCode::WrongPassword);
+    assert!(c.unlock("nuova password lunga").is_ok());
+    c.lock().unwrap();
+    assert_eq!(code(c.change_password(PW, "x")), ErrorCode::Locked);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn il_database_non_viene_mai_creato_allo_sblocco() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    c.lock().unwrap();
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(format!("{}{suffix}", s(&dir.join("gestionale.db"))));
+    }
+    assert_eq!(code(c.unlock(PW)), ErrorCode::DbMissing);
+    assert!(!dir.join("gestionale.db").exists());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn setup_fallito_non_lascia_un_vault_senza_database() {
+    let (dir, c) = core();
+    fs::write(dir.join("gestionale.db"), b"qualcosa").unwrap(); // un file occupa già il posto del DB
+    assert!(c.setup_vault(PW).is_err());
+    assert!(!dir.join("vault").join("vault.meta").exists());
+    assert_eq!(c.status(), Status { initialized: false, unlocked: false });
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn limite_di_ricerca_e_validazione_input() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    for i in 0..105 {
+        c.create_patient(&format!("Prova{i:03}"), "Test", "1990-01-01", None).unwrap();
+    }
+    assert_eq!(c.search_patients("test", 5000).unwrap().len(), 100);
+    assert_eq!(c.search_patients("test", 0).unwrap().len(), 1);
+    assert_eq!(code(c.create_patient(&"x".repeat(101), "Test", "1990-01-01", None)), ErrorCode::InvalidInput);
+    assert_eq!(code(c.create_patient("A", "Bbb", "2023-02-30", None)), ErrorCode::InvalidInput);
+    let long = "a".repeat(10_000);
+    assert!(c.search_patients(&long, 10).is_ok()); // la query viene troncata, non rifiutata
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn codice_fiscale_duplicato_riporta_l_id_esistente() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let a = c.create_patient("Mario", "Rossi", "1980-05-12", Some("RSSMRA80E12A944X")).unwrap();
+    let e = c.create_patient("Altro", "Paziente", "1990-01-01", Some("rssmra80e12a944x")).unwrap_err();
+    assert_eq!(e.code, ErrorCode::DuplicateFiscalCode);
+    assert_eq!(e.detail.as_deref(), Some(a.as_str()));
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn upload_di_cartelle_con_esclusioni_e_errori_per_file() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let root = dir.join("storico");
+    fs::create_dir_all(root.join("2019/endorali")).unwrap();
+    fs::write(root.join("pano.png"), data(3000)).unwrap();
+    fs::write(root.join("2019/referto.pdf"), data(1000)).unwrap();
+    fs::write(root.join("2019/endorali/e1.jpg"), data(500)).unwrap();
+    fs::write(root.join(".DS_Store"), b"x").unwrap();
+    fs::write(root.join("Thumbs.db"), b"x").unwrap();
+    fs::create_dir_all(root.join(".nascosta")).unwrap();
+    fs::write(root.join(".nascosta/x.jpg"), b"x").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(root.join("pano.png"), root.join("collegamento.png")).unwrap();
+    let vault_file = dir.join("vault").join("vault.meta");
+
+    let mut calls = 0;
+    let rep = c
+        .upload_documents(&pid, &[s(&root), s(&dir.join("non-esiste.jpg")), s(&vault_file)], "Altro", |_, t| {
+            calls += 1;
+            assert_eq!(t, 3);
+        })
+        .unwrap();
+    assert_eq!(rep.uploaded.len(), 3);
+    assert_eq!(calls, 3);
+    let names: Vec<&str> = rep.uploaded.iter().map(|u| u.name.as_str()).collect();
+    assert!(names.contains(&"pano.png") && names.contains(&"referto.pdf") && names.contains(&"e1.jpg"));
+    let failed: Vec<(&str, ErrorCode)> = rep.failed.iter().map(|f| (f.name.as_str(), f.code)).collect();
+    assert!(failed.contains(&("non-esiste.jpg", ErrorCode::NotFound)));
+    assert!(failed.contains(&("vault.meta", ErrorCode::InvalidInput)));
+    #[cfg(unix)]
+    assert!(failed.contains(&("collegamento.png", ErrorCode::InvalidInput)));
+
+    // paziente nel cestino: ogni file fallisce con il codice giusto, nessun file lasciato
+    c.delete_patient(&pid).unwrap();
+    let rep2 = c.upload_documents(&pid, &[s(&root.join("pano.png"))], "Altro", |_, _| {}).unwrap();
+    assert!(rep2.uploaded.is_empty());
+    assert_eq!(rep2.failed[0].code, ErrorCode::PatientInTrash);
+    // categoria non valida
+    c.restore_patient(&pid).unwrap();
+    let rep3 = c.upload_documents(&pid, &[s(&root.join("pano.png"))], "Boh", |_, _| {}).unwrap();
+    assert_eq!(rep3.failed[0].code, ErrorCode::InvalidInput);
+    assert_eq!(c.list_documents(&pid, None).unwrap().len(), 3);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn upload_si_ferma_se_l_archivio_si_blocca_a_meta() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let root = dir.join("lotto");
+    fs::create_dir_all(&root).unwrap();
+    for i in 0..4 {
+        fs::write(root.join(format!("f{i}.jpg")), data(200)).unwrap();
+    }
+    let rep = c
+        .upload_documents(&pid, &[s(&root)], "Altro", |done, _| {
+            if done == 2 {
+                c.lock().unwrap(); // blocco manuale durante l'importazione
+            }
+        })
+        .unwrap();
+    assert_eq!(rep.uploaded.len(), 2);
+    assert_eq!(rep.failed.len(), 2);
+    assert!(rep.failed.iter().all(|f| f.code == ErrorCode::Locked));
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn shutdown_aspetta_le_operazioni_pesanti() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let start = Instant::now();
+    std::thread::scope(|sc| {
+        let op = c.begin_op();
+        sc.spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(op);
+        });
+        c.shutdown(Duration::from_secs(5)).unwrap();
+    });
+    assert!(start.elapsed() >= Duration::from_millis(300));
+    assert_eq!(c.status(), Status { initialized: true, unlocked: false });
+    assert_eq!(code(c.search_patients("x", 1)), ErrorCode::Locked);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn shutdown_con_operazione_bloccata_chiude_comunque_e_segnala() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let _op = c.begin_op();
+    assert_eq!(code(c.shutdown(Duration::from_millis(50))), ErrorCode::Internal);
+    assert!(c.lock_session().is_none());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn lock_segnala_lo_snapshot_fallito_ma_blocca() {
+    let dir = tmpdir();
+    // la "cartella" di snapshot è un file: create_dir_all fallisce
+    let bad = dir.join("non-una-cartella");
+    fs::write(&bad, b"x").unwrap();
+    let c = AppCore::new(&dir.join("vault"), &dir.join("g.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 })
+        .with_snapshot_dir(&bad);
+    c.setup_vault(PW).unwrap();
+    assert_eq!(code(c.lock()), ErrorCode::IoError);
+    assert!(c.lock_session().is_none());
+    assert!(!c.lock().unwrap());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn viewer_rispetta_il_limite() {
+    let dir = tmpdir();
+    let c = AppCore::new(&dir.join("vault"), &dir.join("g.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 })
+        .with_viewer_limit(1000);
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let (small, big) = (dir.join("piccolo.jpg"), dir.join("grande.stl"));
+    fs::write(&small, data(900)).unwrap();
+    fs::write(&big, data(5000)).unwrap();
+    c.upload_documents(&pid, &[s(&small), s(&big)], "Scan 3D", |_, _| {}).unwrap();
+    for d in c.list_documents(&pid, None).unwrap() {
+        if d.size_bytes == 5000 {
+            assert_eq!(code(c.open_document(&d.id)), ErrorCode::TooLarge);
+        } else {
+            assert!(c.open_document(&d.id).is_ok());
+        }
+    }
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn export_valida_la_destinazione() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let f = dir.join("a.jpg");
+    fs::write(&f, data(500)).unwrap();
+    c.upload_documents(&pid, &[s(&f)], "Altro", |_, _| {}).unwrap();
+
+    assert_eq!(code(c.export_patient_zip(&pid, &dir.join("a.txt"))), ErrorCode::InvalidInput);
+    assert_eq!(code(c.export_patient_zip(&pid, &dir.join("manca/a.zip"))), ErrorCode::InvalidInput);
+    assert_eq!(code(c.export_patient_zip(&pid, &dir.join("vault").join("a.zip"))), ErrorCode::InvalidInput); // dentro il vault
+    assert_eq!(code(c.export_patient_zip(&pid, &dir.join("vault").join("tmp").join("a.zip"))), ErrorCode::InvalidInput);
+    let ok = dir.join("export.ZIP");
+    assert!(c.export_patient_zip(&pid, &ok).is_ok());
+    assert_eq!(code(c.export_patient_zip(&pid, &ok)), ErrorCode::AlreadyExists);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn cestino_ripristino_e_riassegnazione_via_comandi() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let a = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let b = c.create_patient("Luca", "Bianchi", "1975-01-02", None).unwrap();
+    let f = dir.join("a.jpg");
+    fs::write(&f, data(300)).unwrap();
+    c.upload_documents(&a, &[s(&f)], "Altro", |_, _| {}).unwrap();
+    let id = c.list_documents(&a, None).unwrap()[0].id.clone();
+
+    c.reassign_document(&id, &b).unwrap();
+    assert_eq!(c.list_documents(&a, None).unwrap().len(), 0);
+    c.delete_document(&id).unwrap();
+    c.delete_patient(&a).unwrap();
+    let t = c.list_trash().unwrap();
+    assert_eq!((t.patients.len(), t.documents.len()), (1, 1));
+    assert_eq!(code(c.restore_document("00000000-0000-0000-0000-000000000000")), ErrorCode::NotFound);
+    c.restore_document(&id).unwrap();
+    c.restore_patient(&a).unwrap();
+    assert!(c.list_trash().unwrap().documents.is_empty());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn manutenzione_elimina_il_cestino_scaduto() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let f = dir.join("a.jpg");
+    fs::write(&f, data(300)).unwrap();
+    c.upload_documents(&pid, &[s(&f)], "Altro", |_, _| {}).unwrap();
+    let id = c.list_documents(&pid, None).unwrap()[0].id.clone();
+    assert_eq!(c.maintenance().unwrap(), MaintenanceReport::default()); // nulla di scaduto
+    c.delete_document(&id).unwrap();
+    assert_eq!(c.maintenance().unwrap(), MaintenanceReport::default()); // cestinato da poco
+
+    let keys = c.storage.unlock(PW).unwrap();
+    let db = Db::open(&c.db_path, &keys, "t").unwrap();
+    db.conn()
+        .execute("UPDATE documents SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now','-40 days')", [])
+        .unwrap();
+    drop(db);
+    let r = c.maintenance().unwrap();
+    assert_eq!((r.purged_documents, r.failed_files), (1, 0));
+    assert!(!dir.join("vault").join(format!("{id}.enc")).exists());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn snapshot_e_checkpoint_alla_chiusura_della_sessione() {
+    let dir = tmpdir();
+    let staging = dir.join("staging");
+    let c = AppCore::new(&dir.join("vault"), &dir.join("g.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 })
+        .with_snapshot_dir(&staging);
+    c.setup_vault(PW).unwrap();
+    c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    c.snapshot_db().unwrap(); // periodico
+    assert!(staging.join("gestionale.db").exists());
+    assert!(dir.join("vault").join("audit.checkpoint").exists());
+    c.create_patient("Luca", "Bianchi", "1975-01-02", None).unwrap();
+    c.lock().unwrap(); // chiusura: snapshot aggiornato (sostituisce il precedente) e checkpoint
+    assert!(!staging.join("gestionale.db.new").exists());
+    assert!(dir.join("vault").join("audit.checkpoint").exists());
+
+    let keys = c.storage.unlock(PW).unwrap();
+    let snap = Db::open(&staging.join("gestionale.db"), &keys, "t").unwrap();
+    assert_eq!(snap.search_patients("bianchi", 5).unwrap().len(), 1); // contiene anche l'ultima modifica
+    assert!(!fs::read(staging.join("gestionale.db")).unwrap().starts_with(b"SQLite format 3")); // cifrato
+    assert!(c.snapshot_db().is_err()); // bloccato
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn troncamento_del_registro_accessi_segnalato_allo_sblocco() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    c.lock().unwrap(); // scrive il checkpoint
+    let keys = c.storage.unlock(PW).unwrap();
+    {
+        let db = Db::open(&c.db_path, &keys, "t").unwrap();
+        db.conn()
+            .execute_batch(
+                "DROP TRIGGER audit_no_update; DROP TRIGGER audit_no_delete;
+                 DELETE FROM audit_log WHERE id = (SELECT max(id) FROM audit_log);",
+            )
+            .unwrap();
+    }
+    let info = c.unlock(PW).unwrap();
+    assert!(!info.audit_ok);
+    assert!(info.audit_message.is_some());
+    assert!(c.search_patients("ross", 5).is_ok()); // l'accesso resta possibile: è un avviso
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn errori_serializzati_senza_dettagli_interni() {
+    let e = CommandError::from(CryptoError::WrongPasswordOrCorrupted);
+    let j = serde_json::to_value(&e).unwrap();
+    assert_eq!(j["code"], "WRONG_PASSWORD");
+    assert!(j.get("detail").is_none());
+
+    let e = CommandError::from(DbError::DuplicateFiscalCode { existing_id: "abc".into() });
+    let j = serde_json::to_value(&e).unwrap();
+    assert_eq!((j["code"].as_str(), j["detail"].as_str()), (Some("DUPLICATE_FISCAL_CODE"), Some("abc")));
+
+    // un errore di SQLite non espone il testo originale (tabelle, query)
+    let e = CommandError::from(DbError::Sqlite(rusqlite::Error::SqliteFailure(
+        rusqlite::ffi::Error::new(1),
+        Some("UNIQUE constraint failed: patients.fiscal_code".into()),
+    )));
+    let text = serde_json::to_string(&e).unwrap();
+    assert!(!text.contains("patients") && !text.contains("UNIQUE"));
+    for c in [ErrorCode::TooManyAttempts, ErrorCode::DbMissing, ErrorCode::AuditTampered] {
+        assert!(serde_json::to_string(&c).unwrap().chars().all(|ch| ch == '"' || ch == '_' || ch.is_ascii_uppercase()));
+    }
+    let dto = serde_json::to_value(&Status { initialized: true, unlocked: false }).unwrap();
+    assert_eq!(dto["initialized"], true); // camelCase per il frontend
+    let up = serde_json::to_value(&UploadedDto { id: "1".into(), name: "a".into() }).unwrap();
+    assert!(up.get("id").is_some());
+}
+
+#[test]
+fn mime_e_file_ignorati() {
+    assert_eq!(mime_for("RX.JPG"), "image/jpeg");
+    assert_eq!(mime_for("scan.stl"), "model/stl");
+    assert_eq!(mime_for("senza_estensione"), "application/octet-stream");
+    assert!(is_ignored_child(".DS_Store") && is_ignored_child("THUMBS.DB") && is_ignored_child("desktop.ini"));
+    assert!(!is_ignored_child("rx.jpg"));
+}
+
+#[test]
+fn view_patient_registrato_una_volta_per_intervallo_e_sessione() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    for _ in 0..5 {
+        c.get_patient(&pid).unwrap(); // re-render della scheda
+    }
+    assert_eq!(count(&audit_actions(&c), "VIEW_PATIENT"), 1);
+    // nuova sessione: la prima apertura si registra di nuovo
+    c.lock().unwrap();
+    c.unlock(PW).unwrap();
+    c.get_patient(&pid).unwrap();
+    assert_eq!(count(&audit_actions(&c), "VIEW_PATIENT"), 2);
+    fs::remove_dir_all(dir).ok();
+
+    // intervallo nullo: ogni apertura viene registrata
+    let dir = tmpdir();
+    let c = AppCore::new(&dir.join("vault"), &dir.join("g.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 })
+        .with_view_audit_interval(Duration::ZERO);
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    c.get_patient(&pid).unwrap();
+    c.get_patient(&pid).unwrap();
+    assert_eq!(count(&audit_actions(&c), "VIEW_PATIENT"), 2);
+    assert_eq!(code(c.get_patient("non-esiste")), ErrorCode::NotFound);
+    assert_eq!(count(&audit_actions(&c), "VIEW_PATIENT"), 2);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn checkpoint_scritto_alla_creazione_e_assenza_segnalata() {
+    let (dir, c) = core();
+    let info = c.setup_vault(PW).unwrap();
+    assert!(info.audit_ok);
+    assert!(c.checkpoint_path().exists());
+    c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    c.lock().unwrap();
+    assert_eq!(c.unlock(PW).unwrap(), UnlockInfo::ok());
+    c.lock().unwrap();
+
+    fs::remove_file(c.checkpoint_path()).unwrap(); // per nascondere un troncamento
+    let info = c.unlock(PW).unwrap();
+    assert!(!info.audit_ok);
+    assert!(info.audit_message.unwrap().contains("mancante"));
+    fs::remove_dir_all(dir).ok();
+}
+
+fn read_csv(p: &Path) -> String {
+    let b = fs::read(p).unwrap();
+    assert_eq!(&b[..3], "\u{feff}".as_bytes(), "BOM UTF-8");
+    String::from_utf8(b[3..].to_vec()).unwrap()
+}
+
+#[test]
+fn export_audit_csv_contenuto_filtri_e_registrazione() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", Some("RSSMRA80E12A944X")).unwrap();
+    c.get_patient(&pid).unwrap();
+
+    let out = dir.join("registro.csv");
+    let r = c.export_audit_csv(&out, None, None).unwrap();
+    assert_eq!(r.rows, 2); // il CSV non contiene la propria riga EXPORT_AUDIT...
+    assert!(r.audit_ok); // ...ma la verifica riportata la include
+    let text = read_csv(&out);
+    let lines: Vec<&str> = text.split("\r\n").filter(|l| !l.is_empty()).collect();
+    assert_eq!(lines[0], "id;timestamp_utc;ora_locale;actor;action;target_id;details;prev_hash;row_hash");
+    assert_eq!(lines.len(), 3);
+    assert!(lines[1].starts_with("1;") && lines[1].contains(";admin;CREATE_PATIENT;") && lines[1].contains(&pid));
+    assert!(lines[2].contains(";VIEW_PATIENT;"));
+    for pii in ["Mario", "Rossi", "RSSMRA80E12A944X"] {
+        assert!(!text.contains(pii), "{pii} nel CSV");
+    }
+    // l'export stesso è registrato, con il numero di righe
+    let actions = audit_actions(&c);
+    assert_eq!(actions.last().map(String::as_str), Some("EXPORT_AUDIT"));
+
+    // non sovrascrive, controlla estensione, cartella e vault
+    assert_eq!(code(c.export_audit_csv(&out, None, None)), ErrorCode::AlreadyExists);
+    assert_eq!(code(c.export_audit_csv(&dir.join("registro.txt"), None, None)), ErrorCode::InvalidInput);
+    assert_eq!(code(c.export_audit_csv(&dir.join("manca").join("r.csv"), None, None)), ErrorCode::InvalidInput);
+    assert_eq!(code(c.export_audit_csv(&dir.join("vault").join("r.csv"), None, None)), ErrorCode::InvalidInput);
+    assert_eq!(code(c.export_audit_csv(&dir.join("d.csv"), Some("2026-13-01"), None)), ErrorCode::InvalidInput);
+    assert!(!dir.join("d.csv").exists());
+
+    // filtro per data: nessuna riga nel futuro, ma il file (solo intestazione) si crea
+    let fut = dir.join("futuro.csv");
+    assert_eq!(c.export_audit_csv(&fut, Some("2100-01-01"), None).unwrap().rows, 0);
+    assert_eq!(read_csv(&fut).split("\r\n").filter(|l| !l.is_empty()).count(), 1);
+
+    c.lock().unwrap();
+    assert_eq!(code(c.export_audit_csv(&dir.join("x.csv"), None, None)), ErrorCode::Locked);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn csv_field_quota_e_neutralizza_formule() {
+    assert_eq!(audit::csv_field("semplice"), "semplice");
+    assert_eq!(audit::csv_field("a;b"), "\"a;b\"");
+    assert_eq!(audit::csv_field("di \"lui\""), "\"di \"\"lui\"\"\"");
+    assert_eq!(audit::csv_field("=SOMMA(A1)"), "'=SOMMA(A1)");
+    assert_eq!(audit::csv_field("-1"), "'-1");
+    assert_eq!(audit::csv_field("riga\nnuova"), "\"riga\nnuova\"");
+}
+
+#[test]
+fn i_tentativi_falliti_sopravvivono_al_riavvio() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    c.lock().unwrap();
+    for _ in 0..5 {
+        assert_eq!(code(c.unlock("sbagliata sbagliata")), ErrorCode::WrongPassword);
+    }
+    drop(c);
+    // "riavvio" dell'app: stesso vault, nuovo AppCore
+    let c = AppCore::new(&dir.join("vault"), &dir.join("gestionale.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 });
+    assert_eq!(code(c.unlock(PW)), ErrorCode::TooManyAttempts);
+    // file illeggibile: nessun blocco (il limite non deve impedire l'accesso per un file rotto)
+    fs::write(dir.join("vault").join(THROTTLE_FILE), b"spazzatura").unwrap();
+    let c = AppCore::new(&dir.join("vault"), &dir.join("gestionale.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 });
+    // due errori (sotto la soglia) e poi lo sblocco riuscito: lo stato salvato torna a zero
+    for _ in 0..2 {
+        assert_eq!(code(c.unlock("sbagliata sbagliata")), ErrorCode::WrongPassword);
+    }
+    assert!(fs::read_to_string(dir.join("vault").join(THROTTLE_FILE)).unwrap().starts_with("2:"));
+    c.unlock(PW).unwrap();
+    assert_eq!(fs::read_to_string(dir.join("vault").join(THROTTLE_FILE)).unwrap(), "0:0");
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn una_sessione_nuova_non_raccoglie_i_risultati_della_vecchia() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let (keys, epoch) = c.op_session().unwrap();
+    assert!(c.still_current(epoch));
+    c.lock().unwrap();
+    assert!(!c.still_current(epoch));
+    c.unlock(PW).unwrap(); // stessa password, ma è un'altra sessione
+    assert!(!c.still_current(epoch));
+
+    // upload partito nella vecchia sessione: si ferma al primo controllo, senza lasciare nulla
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let f = dir.join("scan.stl");
+    fs::write(&f, data(3000)).unwrap();
+    let db = c.heavy_db(&keys).unwrap();
+    let mut budget = MAX_UPLOAD_BATCH_BYTES;
+    let e = c.upload_one(&db, &keys, &pid, &f, "scan.stl", "Scan 3D", epoch, &mut budget).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Locked);
+    assert!(c.list_documents(&pid, None).unwrap().is_empty());
+
+    // tetto sui byte letti davvero: il file "cresce" oltre il budget rimasto
+    let (_, now) = c.op_session().unwrap();
+    let mut budget = 1000;
+    let e = c.upload_one(&db, &keys, &pid, &f, "scan.stl", "Scan 3D", now, &mut budget).unwrap_err();
+    assert_eq!(e.code, ErrorCode::TooLarge);
+    assert!(c.list_documents(&pid, None).unwrap().is_empty());
+    let enc = fs::read_dir(dir.join("vault")).unwrap().filter(|e| {
+        e.as_ref().unwrap().file_name().to_string_lossy().ends_with(".enc")
+    });
+    assert_eq!(enc.count(), 0);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn ciclo_completo_backup_e_ripristino() {
+    let dir = tmpdir();
+    let staging = dir.join("backup-staging");
+    let c = AppCore::new(&dir.join("vault"), &dir.join("gestionale.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 })
+        .with_snapshot_dir(&staging);
+    c.setup_vault(PW).unwrap();
+    let pid = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let f = dir.join("rx.jpg");
+    fs::write(&f, data(7000)).unwrap();
+    c.upload_documents(&pid, &[s(&f)], "Panoramica", |_, _| {}).unwrap();
+    c.lock().unwrap(); // scrive snapshot + checkpoint dello snapshot
+    // il backup notturno copia ora la cartella dello snapshot
+    let snap_db = fs::read(staging.join(SNAPSHOT_DB)).unwrap();
+    let snap_cp = fs::read(staging.join(SNAPSHOT_CHECKPOINT)).unwrap();
+
+    // dopo il backup si continua a lavorare: il checkpoint di vault/ diventa più recente
+    c.unlock(PW).unwrap();
+    c.create_patient("Luigi", "Verdi", "1970-01-01", None).unwrap();
+    c.lock().unwrap();
+    let backup_vault = dir.join("copia-vault");
+    fs::create_dir_all(&backup_vault).unwrap();
+    // ...e vault/ (vault.meta e .enc non cambiano con una nuova scheda)
+    for e in fs::read_dir(dir.join("vault")).unwrap() {
+        let e = e.unwrap();
+        if e.file_type().unwrap().is_file() {
+            fs::copy(e.path(), backup_vault.join(e.file_name())).unwrap();
+        }
+    }
+
+    // ripristino su una macchina nuova: vault/ dal backup, DB e checkpoint dallo snapshot
+    let r = dir.join("ripristino");
+    fs::create_dir_all(&r).unwrap();
+    fs::rename(&backup_vault, r.join("vault")).unwrap();
+    fs::write(r.join("gestionale.db"), &snap_db).unwrap();
+    fs::write(r.join("vault").join("audit.checkpoint"), &snap_cp).unwrap();
+    let c2 = AppCore::new(&r.join("vault"), &r.join("gestionale.db"), Duration::from_secs(600))
+        .unwrap()
+        .with_kdf_params(KdfParams { m_kib: 8, t: 2, p: 1 });
+    let info = c2.unlock(PW).unwrap();
+    assert!(info.audit_ok, "{:?}", info.audit_message);
+    let hits = c2.search_patients("Rossi", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    let docs = c2.list_documents(&pid, None).unwrap();
+    assert_eq!(docs.len(), 1);
+    assert_eq!(&c2.open_document(&docs[0].id).unwrap().1[..], &data(7000)[..]);
+    c2.lock().unwrap();
+
+    // lo stesso snapshot con il checkpoint (più recente) di vault/ sembrerebbe troncato
+    fs::copy(dir.join("vault").join("audit.checkpoint"), r.join("vault").join("audit.checkpoint")).unwrap();
+    let info = c2.unlock(PW).unwrap();
+    assert!(!info.audit_ok);
+    fs::remove_dir_all(dir).ok();
+}
+
+// ── import dello storico ──
+
+#[test]
+fn nomi_cartella_e_date_dello_storico() {
+    use import::{parse_folder_date, parse_folder_name};
+    assert_eq!(parse_folder_date("1980-05-12").as_deref(), Some("1980-05-12"));
+    assert_eq!(parse_folder_date("12-05-1980").as_deref(), Some("1980-05-12"));
+    assert_eq!(parse_folder_date("12.05.1980").as_deref(), Some("1980-05-12"));
+    for bad in ["1980.05.12", "12/05/1980", "1980-5-12", "ieri", ""] {
+        assert_eq!(parse_folder_date(bad), None, "{bad}");
+    }
+    assert_eq!(
+        parse_folder_name("De Luca_Maria Grazia_12-05-1980_dlcmgr80e52h501x").unwrap(),
+        ("De Luca".into(), "Maria Grazia".into(), "1980-05-12".into(), Some("dlcmgr80e52h501x".into()))
+    );
+    assert_eq!(parse_folder_name(" Rossi _ Mario _1980-05-12").unwrap().0, "Rossi");
+    for bad in ["Rossi Mario 1980-05-12", "Rossi_Mario", "_Mario_1980-05-12", "Rossi_Mario_12/05/80", "a_b_1980-05-12_cf_extra"] {
+        assert!(parse_folder_name(bad).is_err(), "{bad}");
+    }
+}
+
+/// Storico di esempio: due pazienti validi più tre cartelle/elementi da scartare.
+fn storico(root: &Path) {
+    let w = |rel: &str, n: usize| {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, data(n)).unwrap();
+    };
+    w("Rossi_Mario_1980-05-12/Panoramica/rx.jpg", 1000);
+    w("Rossi_Mario_1980-05-12/endorale/dente.png", 1100); // categoria senza distinguere maiuscole
+    w("Rossi_Mario_1980-05-12/referto.pdf", 1200); // fuori dalle categorie → Altro
+    w("De Luca_Maria Grazia_12-05-1980/Scan 3D/arcata.stl", 1300);
+    w("cartella senza formato/x.jpg", 10);
+    w("Bianchi_Anna_2990-01-01/x.jpg", 10); // data nel futuro
+    w("leggimi.txt", 10); // file fuori da una cartella paziente
+}
+
+fn count_rows(c: &AppCore, sql: &str) -> i64 {
+    let g = c.lock_session();
+    g.as_ref().unwrap().db.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn anteprima_import_non_scrive_nulla() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let rossi = c.create_patient("Mario", "ROSSI", "1980-05-12", None).unwrap(); // già in archivio
+    let root = dir.join("storico");
+    storico(&root);
+    let audit_before = count_rows(&c, "SELECT count(*) FROM audit_log");
+
+    let p = c.preview_import(&root).unwrap();
+    assert_eq!(p.patients.len(), 2);
+    let r = p.patients.iter().find(|x| x.last_name == "Rossi").unwrap();
+    assert_eq!(r.existing_id.as_deref(), Some(rossi.as_str()));
+    assert_eq!((r.files, r.bytes), (3, 3300));
+    let d = p.patients.iter().find(|x| x.last_name == "De Luca").unwrap();
+    assert_eq!((d.first_name.as_str(), d.birth_date.as_str(), d.existing_id.as_deref()), ("Maria Grazia", "1980-05-12", None));
+    assert_eq!((p.total_files, p.total_bytes), (4, 4600));
+    let mut bad: Vec<&str> = p.problems.iter().map(|i| i.folder.as_str()).collect();
+    bad.sort();
+    assert_eq!(bad, vec!["Bianchi_Anna_2990-01-01", "cartella senza formato", "leggimi.txt"]);
+
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM patients"), 1);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM audit_log"), audit_before);
+    // cartelle non valide come radice
+    assert_eq!(code(c.preview_import(&root.join("leggimi.txt"))), ErrorCode::InvalidInput);
+    assert_eq!(code(c.preview_import(&dir.join("manca"))), ErrorCode::InvalidInput);
+    assert_eq!(code(c.preview_import(&dir)), ErrorCode::InvalidInput); // contiene il vault
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn import_crea_abbina_categorizza_e_si_puo_rilanciare() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let rossi = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let root = dir.join("storico");
+    storico(&root);
+
+    let mut progress = Vec::new();
+    let r = c.import_directory(&root, |d, t| progress.push((d, t))).unwrap();
+    assert_eq!((r.patients_created, r.patients_matched, r.uploaded), (1, 1, 4));
+    assert!(r.duplicates.is_empty());
+    assert_eq!(r.failed.len(), 3);
+    assert_eq!(progress.last(), Some(&(4, 4)));
+
+    let tags = |pid: &str| -> Vec<(String, String)> {
+        let mut v: Vec<_> = c.list_documents(pid, None).unwrap().into_iter().map(|d| (d.original_filename, d.category_tag)).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        tags(&rossi),
+        vec![
+            ("dente.png".into(), "Endorale".into()),
+            ("referto.pdf".into(), "Altro".into()),
+            ("rx.jpg".into(), "Panoramica".into()),
+        ]
+    );
+    let hits = c.search_patients("De Luca", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(tags(&hits[0].id), vec![("arcata.stl".into(), "Scan 3D".into())]);
+    let docs = c.list_documents(&rossi, Some("Panoramica")).unwrap();
+    assert_eq!(&c.open_document(&docs[0].id).unwrap().1[..], &data(1000)[..]);
+
+    // rilancio: nessun doppione
+    let r2 = c.import_directory(&root, |_, _| {}).unwrap();
+    assert_eq!((r2.patients_created, r2.patients_matched, r2.uploaded), (0, 2, 0));
+    assert_eq!(r2.duplicates.len(), 4);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM patients"), 2);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM documents"), 4);
+    // ogni scheda e ogni file sono nell'audit come nell'inserimento a mano
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM audit_log WHERE action = 'UPLOAD_FILE'"), 4);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM audit_log WHERE action = 'CREATE_PATIENT'"), 2);
+    assert!(c.lock_session().as_ref().unwrap().db.verify_audit_chain(None).is_ok());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn import_rispetta_cestino_codice_fiscale_e_cartelle_doppie() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let cestinato = c.create_patient("Anna", "Bianchi", "1990-01-01", None).unwrap();
+    c.delete_patient(&cestinato).unwrap();
+    let con_cf = c.create_patient("Luigi", "Verdi", "1970-01-01", Some("VRDLGU70A01H501Z")).unwrap();
+    let root = dir.join("storico");
+    for (folder, file) in [
+        ("Bianchi_Anna_1990-01-01", "a.jpg"),
+        // stesso codice fiscale, nome scritto diversamente: è la stessa scheda
+        ("Verdi_Gigi_01-01-1970_vrdlgu70a01h501z", "b.jpg"),
+        // stessa persona in due cartelle con formati di data diversi
+        ("Neri_Carla_1985-03-03", "c.jpg"),
+        ("neri_carla_03.03.1985", "d.jpg"),
+    ] {
+        fs::create_dir_all(root.join(folder)).unwrap();
+        fs::write(root.join(folder).join(file), file.as_bytes()).unwrap();
+    }
+    let r = c.import_directory(&root, |_, _| {}).unwrap();
+    assert_eq!(r.failed.len(), 1);
+    assert_eq!(r.failed[0].code, ErrorCode::PatientInTrash);
+    assert_eq!((r.patients_created, r.patients_matched, r.uploaded), (1, 2, 3));
+    assert_eq!(c.list_documents(&con_cf, None).unwrap().len(), 1);
+    assert_eq!(c.search_patients("Neri", 10).unwrap().len(), 1);
+    assert_eq!(c.list_documents(&c.search_patients("Neri", 10).unwrap()[0].id, None).unwrap().len(), 2);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn import_interrotto_dal_blocco_si_completa_rilanciandolo() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let root = dir.join("storico");
+    storico(&root);
+    let r = c
+        .import_directory(&root, |done, _| {
+            if done == 1 {
+                c.lock().unwrap(); // blocco dopo il primo file
+            }
+        })
+        .unwrap();
+    assert_eq!(r.uploaded, 1);
+    assert_eq!(r.failed.iter().filter(|i| i.code == ErrorCode::Locked).count(), 3);
+
+    c.unlock(PW).unwrap();
+    let r2 = c.import_directory(&root, |_, _| {}).unwrap();
+    assert_eq!((r2.uploaded, r2.duplicates.len()), (3, 1));
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM documents"), 4);
+    fs::remove_dir_all(dir).ok();
+}
