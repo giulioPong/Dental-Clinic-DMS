@@ -212,4 +212,14 @@ impl Db {
             self.audit_append(c, "REASSIGN_DOCUMENT", Some(doc_id), Some(&format!("from={old};to={new_patient_id}")))
         })
     }
+
+    /// Il paziente ha già un documento con questo contenuto (anche nel cestino: un file
+    /// cestinato apposta non deve tornare con un nuovo import).
+    pub fn has_document_with_hash(&self, patient_id: &str, sha256: &str) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM documents WHERE patient_id = ?1 AND sha256 = ?2)",
+            params![patient_id, sha256],
+            |r| r.get(0),
+        )?)
+    }
 }

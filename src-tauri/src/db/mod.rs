@@ -34,6 +34,7 @@ mod documents;
 pub use error::*;
 pub use schema::*;
 pub use audit::*;
+pub use patients::PatientMatch;
 
 // ───────── Utilità ─────────
 

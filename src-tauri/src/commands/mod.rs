@@ -51,6 +51,7 @@ mod throttle;
 mod patients;
 mod documents;
 mod audit;
+mod import;
 
 pub use dto::*;
 pub use error::*;

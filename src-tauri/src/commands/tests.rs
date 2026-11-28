@@ -746,3 +746,174 @@ fn ciclo_completo_backup_e_ripristino() {
     assert!(!info.audit_ok);
     fs::remove_dir_all(dir).ok();
 }
+
+// ── import dello storico ──
+
+#[test]
+fn nomi_cartella_e_date_dello_storico() {
+    use import::{parse_folder_date, parse_folder_name};
+    assert_eq!(parse_folder_date("1980-05-12").as_deref(), Some("1980-05-12"));
+    assert_eq!(parse_folder_date("12-05-1980").as_deref(), Some("1980-05-12"));
+    assert_eq!(parse_folder_date("12.05.1980").as_deref(), Some("1980-05-12"));
+    for bad in ["1980.05.12", "12/05/1980", "1980-5-12", "ieri", ""] {
+        assert_eq!(parse_folder_date(bad), None, "{bad}");
+    }
+    assert_eq!(
+        parse_folder_name("De Luca_Maria Grazia_12-05-1980_dlcmgr80e52h501x").unwrap(),
+        ("De Luca".into(), "Maria Grazia".into(), "1980-05-12".into(), Some("dlcmgr80e52h501x".into()))
+    );
+    assert_eq!(parse_folder_name(" Rossi _ Mario _1980-05-12").unwrap().0, "Rossi");
+    for bad in ["Rossi Mario 1980-05-12", "Rossi_Mario", "_Mario_1980-05-12", "Rossi_Mario_12/05/80", "a_b_1980-05-12_cf_extra"] {
+        assert!(parse_folder_name(bad).is_err(), "{bad}");
+    }
+}
+
+/// Storico di esempio: due pazienti validi più tre cartelle/elementi da scartare.
+fn storico(root: &Path) {
+    let w = |rel: &str, n: usize| {
+        let p = root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, data(n)).unwrap();
+    };
+    w("Rossi_Mario_1980-05-12/Panoramica/rx.jpg", 1000);
+    w("Rossi_Mario_1980-05-12/endorale/dente.png", 1100); // categoria senza distinguere maiuscole
+    w("Rossi_Mario_1980-05-12/referto.pdf", 1200); // fuori dalle categorie → Altro
+    w("De Luca_Maria Grazia_12-05-1980/Scan 3D/arcata.stl", 1300);
+    w("cartella senza formato/x.jpg", 10);
+    w("Bianchi_Anna_2990-01-01/x.jpg", 10); // data nel futuro
+    w("leggimi.txt", 10); // file fuori da una cartella paziente
+}
+
+fn count_rows(c: &AppCore, sql: &str) -> i64 {
+    let g = c.lock_session();
+    g.as_ref().unwrap().db.conn().query_row(sql, [], |r| r.get(0)).unwrap()
+}
+
+#[test]
+fn anteprima_import_non_scrive_nulla() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let rossi = c.create_patient("Mario", "ROSSI", "1980-05-12", None).unwrap(); // già in archivio
+    let root = dir.join("storico");
+    storico(&root);
+    let audit_before = count_rows(&c, "SELECT count(*) FROM audit_log");
+
+    let p = c.preview_import(&root).unwrap();
+    assert_eq!(p.patients.len(), 2);
+    let r = p.patients.iter().find(|x| x.last_name == "Rossi").unwrap();
+    assert_eq!(r.existing_id.as_deref(), Some(rossi.as_str()));
+    assert_eq!((r.files, r.bytes), (3, 3300));
+    let d = p.patients.iter().find(|x| x.last_name == "De Luca").unwrap();
+    assert_eq!((d.first_name.as_str(), d.birth_date.as_str(), d.existing_id.as_deref()), ("Maria Grazia", "1980-05-12", None));
+    assert_eq!((p.total_files, p.total_bytes), (4, 4600));
+    let mut bad: Vec<&str> = p.problems.iter().map(|i| i.folder.as_str()).collect();
+    bad.sort();
+    assert_eq!(bad, vec!["Bianchi_Anna_2990-01-01", "cartella senza formato", "leggimi.txt"]);
+
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM patients"), 1);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM audit_log"), audit_before);
+    // cartelle non valide come radice
+    assert_eq!(code(c.preview_import(&root.join("leggimi.txt"))), ErrorCode::InvalidInput);
+    assert_eq!(code(c.preview_import(&dir.join("manca"))), ErrorCode::InvalidInput);
+    assert_eq!(code(c.preview_import(&dir)), ErrorCode::InvalidInput); // contiene il vault
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn import_crea_abbina_categorizza_e_si_puo_rilanciare() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let rossi = c.create_patient("Mario", "Rossi", "1980-05-12", None).unwrap();
+    let root = dir.join("storico");
+    storico(&root);
+
+    let mut progress = Vec::new();
+    let r = c.import_directory(&root, |d, t| progress.push((d, t))).unwrap();
+    assert_eq!((r.patients_created, r.patients_matched, r.uploaded), (1, 1, 4));
+    assert!(r.duplicates.is_empty());
+    assert_eq!(r.failed.len(), 3);
+    assert_eq!(progress.last(), Some(&(4, 4)));
+
+    let tags = |pid: &str| -> Vec<(String, String)> {
+        let mut v: Vec<_> = c.list_documents(pid, None).unwrap().into_iter().map(|d| (d.original_filename, d.category_tag)).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(
+        tags(&rossi),
+        vec![
+            ("dente.png".into(), "Endorale".into()),
+            ("referto.pdf".into(), "Altro".into()),
+            ("rx.jpg".into(), "Panoramica".into()),
+        ]
+    );
+    let hits = c.search_patients("De Luca", 10).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(tags(&hits[0].id), vec![("arcata.stl".into(), "Scan 3D".into())]);
+    let docs = c.list_documents(&rossi, Some("Panoramica")).unwrap();
+    assert_eq!(&c.open_document(&docs[0].id).unwrap().1[..], &data(1000)[..]);
+
+    // rilancio: nessun doppione
+    let r2 = c.import_directory(&root, |_, _| {}).unwrap();
+    assert_eq!((r2.patients_created, r2.patients_matched, r2.uploaded), (0, 2, 0));
+    assert_eq!(r2.duplicates.len(), 4);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM patients"), 2);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM documents"), 4);
+    // ogni scheda e ogni file sono nell'audit come nell'inserimento a mano
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM audit_log WHERE action = 'UPLOAD_FILE'"), 4);
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM audit_log WHERE action = 'CREATE_PATIENT'"), 2);
+    assert!(c.lock_session().as_ref().unwrap().db.verify_audit_chain(None).is_ok());
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn import_rispetta_cestino_codice_fiscale_e_cartelle_doppie() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let cestinato = c.create_patient("Anna", "Bianchi", "1990-01-01", None).unwrap();
+    c.delete_patient(&cestinato).unwrap();
+    let con_cf = c.create_patient("Luigi", "Verdi", "1970-01-01", Some("VRDLGU70A01H501Z")).unwrap();
+    let root = dir.join("storico");
+    for (folder, file) in [
+        ("Bianchi_Anna_1990-01-01", "a.jpg"),
+        // stesso codice fiscale, nome scritto diversamente: è la stessa scheda
+        ("Verdi_Gigi_01-01-1970_vrdlgu70a01h501z", "b.jpg"),
+        // stessa persona in due cartelle con formati di data diversi
+        ("Neri_Carla_1985-03-03", "c.jpg"),
+        ("neri_carla_03.03.1985", "d.jpg"),
+    ] {
+        fs::create_dir_all(root.join(folder)).unwrap();
+        fs::write(root.join(folder).join(file), file.as_bytes()).unwrap();
+    }
+    let r = c.import_directory(&root, |_, _| {}).unwrap();
+    assert_eq!(r.failed.len(), 1);
+    assert_eq!(r.failed[0].code, ErrorCode::PatientInTrash);
+    assert_eq!((r.patients_created, r.patients_matched, r.uploaded), (1, 2, 3));
+    assert_eq!(c.list_documents(&con_cf, None).unwrap().len(), 1);
+    assert_eq!(c.search_patients("Neri", 10).unwrap().len(), 1);
+    assert_eq!(c.list_documents(&c.search_patients("Neri", 10).unwrap()[0].id, None).unwrap().len(), 2);
+    fs::remove_dir_all(dir).ok();
+}
+
+#[test]
+fn import_interrotto_dal_blocco_si_completa_rilanciandolo() {
+    let (dir, c) = core();
+    c.setup_vault(PW).unwrap();
+    let root = dir.join("storico");
+    storico(&root);
+    let r = c
+        .import_directory(&root, |done, _| {
+            if done == 1 {
+                c.lock().unwrap(); // blocco dopo il primo file
+            }
+        })
+        .unwrap();
+    assert_eq!(r.uploaded, 1);
+    assert_eq!(r.failed.iter().filter(|i| i.code == ErrorCode::Locked).count(), 3);
+
+    c.unlock(PW).unwrap();
+    let r2 = c.import_directory(&root, |_, _| {}).unwrap();
+    assert_eq!((r2.uploaded, r2.duplicates.len()), (3, 1));
+    assert_eq!(count_rows(&c, "SELECT count(*) FROM documents"), 4);
+    fs::remove_dir_all(dir).ok();
+}

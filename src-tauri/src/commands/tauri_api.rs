@@ -10,7 +10,7 @@
 //! ```
 //!
 //! Eventi verso il frontend: `vault-locked` (mostra subito la Lock Screen),
-//! `upload-progress` `{ done, total }` e `backup-error` `{ message }` (archivio bloccato,
+//! `upload-progress` e `import-progress` `{ done, total }` e `backup-error` `{ message }` (archivio bloccato,
 //! ma checkpoint o snapshot non salvati: va mostrato un avviso), `maintenance-report`
 //! (esito della manutenzione dopo lo sblocco: `failedFiles > 0` va segnalato) e
 //! `maintenance-error` `{ message }`.
@@ -242,6 +242,25 @@ pub async fn export_patient_zip(core: Core<'_>, patient_id: String, dest_path: S
     blocking(move || core.export_patient_zip(&patient_id, Path::new(&dest_path))).await
 }
 
+/// Import dello storico: anteprima senza scritture (vedi `commands/import.rs`).
+#[tauri::command]
+pub async fn preview_import(core: Core<'_>, root_path: String) -> Res<ImportPreviewDto> {
+    let core = core.inner().clone();
+    blocking(move || core.preview_import(Path::new(&root_path))).await
+}
+
+/// Import dello storico: crea i pazienti mancanti e carica i file, con avanzamento.
+#[tauri::command]
+pub async fn import_directory(app: AppHandle, core: Core<'_>, root_path: String) -> Res<ImportReportDto> {
+    let core = core.inner().clone();
+    blocking(move || {
+        core.import_directory(Path::new(&root_path), |done, total| {
+            let _ = app.emit("import-progress", ProgressPayload { done, total });
+        })
+    })
+    .await
+}
+
 /// Registro degli accessi in CSV. Date facoltative `YYYY-MM-DD` (giorni locali), estremi inclusi.
 #[tauri::command]
 pub async fn export_audit_csv(
@@ -348,6 +367,8 @@ pub fn run() {
             open_document,
             export_patient_zip,
             export_audit_csv,
+            preview_import,
+            import_directory,
             run_maintenance,
         ])
         .build(tauri::generate_context!())

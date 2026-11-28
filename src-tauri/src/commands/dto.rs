@@ -136,3 +136,52 @@ impl From<DocumentRecord> for DocumentDto {
         }
     }
 }
+
+// ───────── Import dello storico ─────────
+
+/// Problema su una cartella o su un file dell'import. `file` è il percorso relativo alla
+/// cartella del paziente (assente se il problema riguarda la cartella).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportIssueDto {
+    pub folder: String,
+    pub file: Option<String>,
+    pub code: ErrorCode,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPatientDto {
+    pub folder: String,
+    pub last_name: String,
+    pub first_name: String,
+    pub birth_date: String,
+    pub fiscal_code: Option<String>,
+    /// Scheda già presente a cui verranno aggiunti i documenti; `None` = verrà creata.
+    pub existing_id: Option<String>,
+    pub files: u32,
+    pub bytes: u64,
+}
+
+/// Anteprima: cosa farebbe l'import, senza scrivere nulla.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPreviewDto {
+    pub patients: Vec<ImportPatientDto>,
+    pub problems: Vec<ImportIssueDto>,
+    pub total_files: u32,
+    pub total_bytes: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportReportDto {
+    pub patients_created: u32,
+    pub patients_matched: u32,
+    pub uploaded: u32,
+    /// File già presenti per quel paziente (stesso contenuto): saltati.
+    pub duplicates: Vec<ImportIssueDto>,
+    /// Cartelle o file non importati, con il motivo.
+    pub failed: Vec<ImportIssueDto>,
+}

@@ -2,6 +2,17 @@
 
 use super::*;
 
+/// Esito della ricerca di un paziente già presente (import dello storico).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PatientMatch {
+    None,
+    Active(String),
+    /// Esiste ma è nel cestino: va ripristinato prima, non si duplica.
+    InTrash(String),
+    /// Più schede attive con stessi nome, cognome e data: serve una scelta a mano.
+    Ambiguous,
+}
+
 impl Db {
     pub fn create_patient(&self, first: &str, last: &str, birth: &str, fiscal_code: Option<&str>) -> Result<String> {
         let (first, last) = (first.trim(), last.trim());
@@ -196,4 +207,54 @@ pub(super) fn split_terms(input: &str) -> (Vec<String>, Vec<String>) {
         }
     }
     (long, short)
+}
+
+impl Db {
+    /// Paziente già presente per l'import. Con codice fiscale si cerca prima quello; poi
+    /// cognome, nome (senza distinguere maiuscole) e data di nascita, escludendo le schede
+    /// con un codice fiscale diverso (sono altre persone).
+    pub fn find_patient_for_import(&self, first: &str, last: &str, birth: &str, fiscal_code: Option<&str>) -> Result<PatientMatch> {
+        let cf = normalize_fiscal_code(fiscal_code);
+        if let Some(cf) = &cf {
+            let by_cf: Vec<(String, Option<String>)> = {
+                let mut st = self.conn.prepare("SELECT id, deleted_at FROM patients WHERE fiscal_code = ?1")?;
+                let rows = st.query_map(params![cf], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                rows.collect::<rusqlite::Result<_>>()?
+            };
+            if let Some((id, _)) = by_cf.iter().find(|(_, del)| del.is_none()) {
+                return Ok(PatientMatch::Active(id.clone()));
+            }
+            if let Some((id, _)) = by_cf.first() {
+                return Ok(PatientMatch::InTrash(id.clone()));
+            }
+        }
+        let rows: Vec<(String, Option<String>, Option<String>)> = {
+            let mut st = self.conn.prepare(
+                "SELECT id, deleted_at, fiscal_code FROM patients
+                 WHERE lower(last_name) = lower(?1) AND lower(first_name) = lower(?2) AND birth_date = ?3",
+            )?;
+            let rows = st.query_map(params![last.trim(), first.trim(), birth], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let same_person: Vec<_> =
+            rows.into_iter().filter(|(_, _, other)| cf.is_none() || other.is_none() || *other == cf).collect();
+        let active: Vec<_> = same_person.iter().filter(|(_, del, _)| del.is_none()).collect();
+        Ok(match active.len() {
+            1 => PatientMatch::Active(active[0].0.clone()),
+            0 => match same_person.first() {
+                Some((id, _, _)) => PatientMatch::InTrash(id.clone()),
+                None => PatientMatch::None,
+            },
+            _ => PatientMatch::Ambiguous,
+        })
+    }
+
+    /// Data di nascita accettabile (stesse regole di `create_patient`).
+    pub fn is_valid_birth_date(&self, birth: &str) -> Result<bool> {
+        match check_birth_date(&self.conn, birth) {
+            Ok(()) => Ok(true),
+            Err(DbError::InvalidInput(_)) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
 }
